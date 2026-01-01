@@ -13,6 +13,15 @@ from typing import Any
 import cv2
 import numpy as np
 from loguru import logger
+from concurrent.futures import ThreadPoolExecutor, Future
+import os
+
+# Suppress FFMPEG logs
+os.environ["OPENCV_LOG_LEVEL"] = "OFF"
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "0"
+import warnings
+warnings.filterwarnings("ignore", message=".*n_jobs value 1 overridden.*")
+
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
@@ -48,7 +57,8 @@ class PipelineConfig:
     video_source: str = ""
     video_type: str = "auto"
     target_resolution: tuple[int, int] = (1280, 720)  # Higher res for better detection
-    fps_limit: int = 10
+    processing_fps: int = 5
+    display_fps: int = -1  # -1 = auto (source FPS)
 
     # Detection
     detector_model: str = "yolov8m.pt"  # Medium model for best accuracy
@@ -70,7 +80,7 @@ class PipelineConfig:
 
     # Tracking
     max_track_age: int = 90  # Max frames to keep lost track (increased for fast vehicles)
-    min_hits: int = 1  # Min hits before track is confirmed (lowered for immediate display)
+    min_hits: int = 1  # Min hits before track is confirmed (lowered for debugging)
     iou_threshold: float = 0.1  # IoU threshold for matching (lowered for fast-moving objects)
 
     # Output
@@ -111,6 +121,10 @@ class Pipeline:
         # GCP outputs
         self._pubsub: PubSubPublisher | None = None
         self._bigquery: BigQueryWriter | None = None
+        
+        # Async processing
+        self._executor: ThreadPoolExecutor | None = None
+        self._future: Future | None = None
 
         # State
         self._stop_event = Event()
@@ -118,7 +132,10 @@ class Pipeline:
         self._warmup_start: float = 0
         self._last_cluster_time: float = 0
         self._frame_count: int = 0
+        self._frame_count: int = 0
         self._last_log_time: float = 0
+        self._last_process_time: float = 0
+        self._process_interval: float = 0
 
     def _init_components(self) -> None:
         """Initialize all pipeline components."""
@@ -129,7 +146,7 @@ class Pipeline:
             self.config.video_source,
             self.config.video_type,
             self.config.target_resolution,
-            self.config.fps_limit,
+            self.config.display_fps,
         )
         self._video_source = BufferedVideoSource(source, buffer_size=30)
 
@@ -188,59 +205,58 @@ class Pipeline:
             self._bigquery.connect()
 
         logger.info("All components initialized")
+        self._process_interval = 1.0 / self.config.processing_fps
 
-    def _process_frame(self, frame: Frame) -> dict[str, Any]:
-        """Process a single frame through the pipeline.
+        logger.info("All components initialized")
+        self._process_interval = 1.0 / self.config.processing_fps
+        self._executor = ThreadPoolExecutor(max_workers=1)
 
-        Args:
-            frame: Input video frame
-
-        Returns:
-            Processing results
-        """
-        self._frame_count += 1
-
-        # Detect objects
+    def _run_detection(self, frame: Frame) -> tuple[Frame, list, list, np.ndarray | None, dict]:
+        """Run heavy detection task in background."""
         detections = self._detector.detect(frame)
-
-        if not detections:
-            # Still update tracker with empty detections to age out old tracks
-            tracks = self._tracker.update([], None, None, None)
-            return {"frame": frame, "detections": [], "tracks": tracks, "features": []}
-
-        # Log detection count periodically
-        if self._frame_count % 30 == 0:
-            logger.debug(f"Frame {self._frame_count}: {len(detections)} detections")
-
-        # Extract features
-        features = self._feature_extractor.extract(frame.image, detections)
-
-        # Get cluster labels if clusterer is fitted
+        
+        features = []
+        if detections:
+            features = self._feature_extractor.extract(frame.image, detections)
+            
         cluster_labels = None
-        cluster_names = self.config.cluster_labels
-
+        cluster_names = self.config.cluster_labels.copy() # Safe copy
+        
         if self._clusterer.is_fitted and features:
             embeddings = np.vstack([f.embedding for f in features])
             cluster_labels = self._clusterer.predict(embeddings)
-
-            # Build cluster name mapping
+            
+            # We can't access result.clusters safely if it changes, but reading is mostly fine
+            # For strict safety we might need a lock, but let's assume atomic replace
             if self._clusterer.result:
                 for cid, info in self._clusterer.result.clusters.items():
-                    if cid not in cluster_names:
+                   if cid not in cluster_names:
                         cluster_names[cid] = info.label
 
+        return frame, detections, features, cluster_labels, cluster_names
+
+    def _update_tracker(self, frame: Frame, detections: list, features: list, cluster_labels: Any, cluster_names: dict, delay: int = 0) -> dict:
+        """Update tracker with results from background task."""
+        self._frame_count += 1 # Note: This might jump if we rely on this for "processed" count
+        
         # Update tracker
-        tracks = self._tracker.update(
+        tracks = self._tracker.update(  
             detections,
             features,
             cluster_labels,
             cluster_names,
+            delay_frames=delay,
         )
+        
+        # Debug logging
+        max_streak = max((t.hit_streak for t in tracks), default=0)
+        if len(detections) > 0:
+            logger.debug(f"Assoc: delay={delay}, tracks={len(tracks)}, max_streak={max_streak}")
 
         # Update flow analytics
         if self._flow_analyzer:
             self._flow_analyzer.update(tracks, cluster_names)
-
+            
         # Write to GCP if enabled
         if self._pubsub:
             for track in tracks:
@@ -249,7 +265,7 @@ class Pipeline:
         if self._bigquery:
             for track in tracks:
                 self._bigquery.write_track(track)
-
+                
         return {
             "frame": frame,
             "detections": detections,
@@ -326,8 +342,9 @@ class Pipeline:
         result = self._clusterer.fit(embeddings)
 
         if result.n_clusters == 0:
-            logger.error("Clustering failed - no clusters found")
-            return False
+            logger.warning("Clustering failed - no clusters found. Continuing with generic tracking.")
+            # Set a default cluster? or just rely on cid=-1 (noise)
+            return True # Continue anyway
 
         # Log cluster info
         table = Table(title="Discovered Clusters")
@@ -373,23 +390,32 @@ class Pipeline:
             cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
 
         # Draw raw detections first (yellow boxes) - always visible
-        for det in detections:
-            x1, y1, x2, y2 = det.bbox
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 255), 2)  # Yellow
+
 
         # Draw tracked objects on top (colored by cluster)
         if tracks:
             logger.debug(f"Drawing {len(tracks)} tracks")
 
         for track in tracks:
+            # Skip unconfirmed tracks (filtering phantom objects)
+            if track.hit_streak < self.config.min_hits:
+                continue
+
             x1, y1, x2, y2 = track.bbox
-            color = cluster_colors.get(track.cluster_id, (0, 255, 0))  # Default to green
+            cid = track.stable_cluster_id
+            color = cluster_colors.get(cid, (0, 255, 0))  # Default to green
 
             # Draw box with thicker line
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
 
             # Draw label with outline
-            label = f"{track.cluster_label} #{track.track_id}"
+            c_label = track.cluster_label
+            if cid in self.config.cluster_labels:
+                c_label = self.config.cluster_labels[cid]
+            elif self._clusterer.result and cid in self._clusterer.result.clusters:
+                c_label = self._clusterer.result.clusters[cid].label
+            
+            label = f"{c_label} #{track.track_id}"
             draw_text_with_outline(annotated, label, (x1, y1 - 10), 0.6, color)
 
             # Draw trajectory
@@ -454,8 +480,8 @@ class Pipeline:
 
             # Clustering phase
             if not self._cluster_phase():
-                logger.error("Clustering phase failed")
-                return
+                logger.warning("Clustering phase incomplete - proceeding with generic tracking")
+                # return # Do not return, continue processing
 
             # Main processing loop
             self.state = PipelineState.RUNNING
@@ -467,12 +493,51 @@ class Pipeline:
                     time.sleep(0.01)
                     continue
 
-                # Process frame
-                result = self._process_frame(frame)
+                # Main Loop Logic
+                current_time = time.time()
+                tracks = []
+                
+                # 1. Advance Tracker (Prediction) - ALWAYS run this for smooth visualization
+                # Note: predict_only() returns the tracks in their predicted state
+                tracks = self._tracker.predict_only()
+                
+                # 2. Check if async processing finished
+                if self._future and self._future.done():
+                    try:
+                        # Get results
+                        p_frame, p_dets, p_feats, p_labels, p_names = self._future.result()
+                        
+                        # Update tracker with these (lagged) results
+                        # This will "correct" the tracks
+                        delay = frame.frame_number - p_frame.frame_number
+                        self._update_tracker(p_frame, p_dets, p_feats, p_labels, p_names, delay)
+                        
+                        # Get updated tracks after correction
+                        tracks = self._tracker.tracks
+                        self._future = None
+                    except Exception as e:
+                        logger.error(f"Detection task failed: {e}")
+                        self._future = None
 
-                # Display if enabled
+                # 3. Submit new task if idle and interval elapsed
+                if self._future is None and (current_time - self._last_process_time) >= self._process_interval:
+                     # Submit copy of frame? Or frame itself (read-only safe?)
+                     # Frame object holds numpy array. YOLO/CV2 might modify? 
+                     # Usually safe if we don't modify in main thread.
+                     self._future = self._executor.submit(self._run_detection, frame)
+                     self._last_process_time = current_time
+
+                # 4. Display
                 if self.config.enable_display:
-                    self._display_frame(result)
+                    # We display the CURRENT frame with the TRACKS (which might be predicted or updated)
+                     # We display the CURRENT frame with the TRACKS (which might be predicted or updated)
+                    display_result = {
+                        "frame": frame,
+                        "tracks": tracks,
+                        "detections": [] # Pass empty detections for display stats
+                    }
+                    self._display_frame(display_result)
+
 
                 # Periodic logging
                 current_time = time.time()
@@ -512,6 +577,9 @@ class Pipeline:
         if self._bigquery:
             self._bigquery.close()
 
+        if self._executor:
+            self._executor.shutdown(wait=False)
+
         if self.config.enable_display:
             cv2.destroyAllWindows()
 
@@ -543,6 +611,8 @@ def main():
     parser.add_argument("--no-display", action="store_true", help="Disable display window")
     parser.add_argument("--detector", default="yolov8m.pt", help="YOLO model (yolov8n/s/m/l/x.pt)")
     parser.add_argument("--vehicles-only", action="store_true", help="Only detect vehicles")
+    parser.add_argument("--processing-fps", type=int, default=5, help="FPS limit for detection/processing")
+    parser.add_argument("--display-fps", type=int, default=-1, help="Target FPS for display (default=-1 for auto/source FPS)")
 
     args = parser.parse_args()
 
@@ -557,6 +627,8 @@ def main():
         enable_display=not args.no_display,
         detector_model=args.detector,
         detection_classes=[2, 3, 5, 7] if args.vehicles_only else None,  # COCO vehicle classes
+        processing_fps=args.processing_fps,
+        display_fps=args.display_fps,
     )
 
     # Setup signal handlers

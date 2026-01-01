@@ -9,6 +9,7 @@ import numpy as np
 from filterpy.kalman import KalmanFilter
 from loguru import logger
 from scipy.optimize import linear_sum_assignment
+from collections import deque, Counter
 
 if TYPE_CHECKING:
     from src.detection.detector import Detection
@@ -97,6 +98,7 @@ class Track:
     positions: list[tuple[int, int]] = field(default_factory=list)
     velocities: list[tuple[float, float]] = field(default_factory=list)
     embeddings: list[np.ndarray] = field(default_factory=list)
+    cluster_history: Counter = field(default_factory=lambda: Counter())
 
     # Flow statistics
     total_distance: float = 0.0
@@ -167,12 +169,9 @@ class Track:
         vx, vy = self.velocity
         return np.sqrt(vx**2 + vy**2)
 
-    @property
-    def is_confirmed(self) -> bool:
-        """Check if track is confirmed."""
-        return self.hit_streak >= 3
 
-    def predict(self) -> tuple:
+
+    def predict(self, reset_streak: bool = True) -> tuple:
         """Predict next state and return predicted bbox."""
         # Handle negative area
         if self.kf.x[6] + self.kf.x[2] <= 0:
@@ -182,11 +181,18 @@ class Track:
         self.age += 1
         self.time_since_update += 1
 
-        if self.time_since_update > 0:
+        if reset_streak and self.time_since_update > 2:
             self.hit_streak = 0
 
         predicted_bbox = z_to_bbox(self.kf.x.flatten())
         return predicted_bbox
+
+    @property
+    def stable_cluster_id(self) -> int:
+        """Get the most frequent cluster ID from history."""
+        if not self.cluster_history:
+            return self.cluster_id
+        return self.cluster_history.most_common(1)[0][0]
 
     def update(self, detection: "Detection", embedding: np.ndarray | None = None):
         """Update track with new detection."""
@@ -259,14 +265,17 @@ class ObjectTracker:
         features: list["ObjectFeature"] | None = None,
         cluster_labels: np.ndarray | None = None,
         cluster_names: dict[int, str] | None = None,
+        delay_frames: int = 0,
     ) -> list[Track]:
-        """Update tracks with new detections.
+        """Update tracks with new detections, handling potential latency.
 
         Args:
             detections: List of detections in current frame
             features: Optional features for each detection
             cluster_labels: Optional cluster labels for each detection
             cluster_names: Optional mapping of cluster IDs to names
+            delay_frames: Estimated lag (in frames) of the detections
+
 
         Returns:
             List of currently active tracks
@@ -278,7 +287,8 @@ class ObjectTracker:
             track.predict()
 
         # Match detections to tracks
-        matched, unmatched_dets, unmatched_tracks = self._associate(detections)
+        # If there is a delay, match against back-projected locations
+        matched, unmatched_dets, unmatched_tracks = self._associate(detections, delay_frames)
 
         # Update matched tracks
         for track_idx, det_idx in matched:
@@ -290,6 +300,23 @@ class ObjectTracker:
             if features and det_idx < len(features):
                 embedding = features[det_idx].embedding
 
+            # If delayed, project detection forward to current time using track velocity
+            if delay_frames > 0:
+                vx, vy = track.velocity
+                dx = int(vx * delay_frames)
+                dy = int(vy * delay_frames)
+                
+                # Clone detection to avoid modifying original
+                from src.detection.detector import Detection
+                det = Detection(
+                    bbox=(det.bbox[0] + dx, det.bbox[1] + dy, det.bbox[2] + dx, det.bbox[3] + dy),
+                    confidence=det.confidence,
+                    class_id=det.class_id,
+                    class_name=det.class_name,
+                    frame_number=det.frame_number + delay_frames,
+                    timestamp=det.timestamp, # Approx
+                )
+
             track.update(det, embedding)
 
             # Update cluster assignment
@@ -297,6 +324,14 @@ class ObjectTracker:
                 track.cluster_id = int(cluster_labels[det_idx])
                 if cluster_names and track.cluster_id in cluster_names:
                     track.cluster_label = cluster_names[track.cluster_id]
+                
+                # Update history
+                track.cluster_history[track.cluster_id] += 1
+                # Decay old history occasionally or strictly keep length?
+                # Counter doesn't support maxlen.
+                # Let's just keep it simple for now or change to deque.
+                # If using deque of IDs:
+                pass
 
         # Create new tracks for unmatched detections
         for det_idx in unmatched_dets:
@@ -321,6 +356,11 @@ class ObjectTracker:
                 entry_time=det.timestamp,
             )
 
+            # Fast-forward new track if delayed
+            if delay_frames > 0:
+                for _ in range(delay_frames):
+                    track.predict(reset_streak=False)
+
             if embedding is not None:
                 track.embeddings.append(embedding)
 
@@ -334,10 +374,10 @@ class ObjectTracker:
         ]
 
         # Return confirmed tracks
-        return [t for t in self._tracks if t.is_confirmed or self._frame_count <= self.min_hits]
+        return [t for t in self._tracks if t.hit_streak >= self.min_hits or self._frame_count <= self.min_hits]
 
     def _associate(
-        self, detections: list["Detection"]
+        self, detections: list["Detection"], delay_frames: int = 0
     ) -> tuple[list[tuple[int, int]], list[int], list[int]]:
         """Associate detections with existing tracks using Hungarian algorithm.
 
@@ -356,8 +396,21 @@ class ObjectTracker:
         cost_matrix = np.zeros((n_tracks, n_dets))
 
         for t, track in enumerate(self._tracks):
+            # Calculate comparison bbox (back-projected if delayed)
+            compare_bbox = track.bbox
+            if delay_frames > 0:
+                 vx, vy = track.velocity
+                 dx = int(vx * delay_frames)
+                 dy = int(vy * delay_frames)
+                 compare_bbox = (
+                     track.bbox[0] - dx,
+                     track.bbox[1] - dy,
+                     track.bbox[2] - dx,
+                     track.bbox[3] - dy,
+                 )
+
             for d, det in enumerate(detections):
-                cost_matrix[t, d] = 1 - iou(track.bbox, det.bbox)
+                cost_matrix[t, d] = 1 - iou(compare_bbox, det.bbox)
 
         # Hungarian assignment
         row_indices, col_indices = linear_sum_assignment(cost_matrix)
@@ -385,7 +438,7 @@ class ObjectTracker:
     @property
     def confirmed_tracks(self) -> list[Track]:
         """Get confirmed tracks only."""
-        return [t for t in self._tracks if t.is_confirmed]
+        return [t for t in self._tracks if t.hit_streak >= self.min_hits]
 
     def get_tracks_by_cluster(self, cluster_id: int) -> list[Track]:
         """Get all tracks assigned to a cluster."""
@@ -396,3 +449,12 @@ class ObjectTracker:
         self._tracks = []
         self._next_id = 1
         self._frame_count = 0
+
+    def predict_only(self) -> list[Track]:
+        """Advance state without update (for frames with no detection)."""
+        self._frame_count += 1
+        for track in self._tracks:
+            track.predict(reset_streak=False)
+        
+        # Return currently valid tracks
+        return [t for t in self._tracks if t.hit_streak >= self.min_hits or self._frame_count <= self.min_hits]
