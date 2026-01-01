@@ -1,0 +1,65 @@
+# SOSD Docker Compose configuration
+# Supports both local development and GCP deployment
+
+services:
+  # Main SOSD pipeline
+  sosd-pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sosd-pipeline:latest
+    container_name: sosd-pipeline
+    environment:
+      - SOSD_VIDEO__SOURCE=${VIDEO_SOURCE:-0}
+      - SOSD_VIDEO__SOURCE_TYPE=${VIDEO_TYPE:-auto}
+      - SOSD_CLUSTERING__WARMUP_DURATION=${WARMUP_DURATION:-60}
+      - SOSD_FEATURES__DEVICE=cpu  # Change to cuda for GPU
+      - SOSD_OUTPUT__ENABLE_PUBSUB=${ENABLE_PUBSUB:-false}
+      - SOSD_OUTPUT__PUBSUB_PROJECT=${GCP_PROJECT:-}
+      - SOSD_OUTPUT__ENABLE_BIGQUERY=${ENABLE_BIGQUERY:-false}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/gcp-key.json
+    volumes:
+      - ./data:/app/data
+      - ./credentials:/app/credentials:ro
+      - /dev/video0:/dev/video0  # Webcam access (Linux)
+    devices:
+      - /dev/video0:/dev/video0  # Webcam (Linux)
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    # For GPU support, uncomment:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # Streamlit dashboard
+  sosd-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sosd-pipeline:latest
+    container_name: sosd-dashboard
+    command: streamlit run src/output/dashboard.py --server.port 8501 --server.address 0.0.0.0
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+
+  # Redis for shared state (optional)
+  redis:
+    image: redis:7-alpine
+    container_name: sosd-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    profiles:
+      - full
+
+volumes:
+  redis-data:

@@ -1,0 +1,578 @@
+"""Main SOSD pipeline orchestrating all components."""
+
+from __future__ import annotations
+
+import signal
+import sys
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from threading import Event
+from typing import Any
+
+import cv2
+import numpy as np
+from loguru import logger
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+from rich.table import Table
+
+from src.analytics.flow_analyzer import FlowAnalyzer
+from src.clustering.clusterer import ObjectClusterer
+from src.detection.detector import ObjectDetector
+from src.features.extractor import DINOv2Extractor, FeatureBuffer
+from src.ingestion.video_source import BufferedVideoSource, Frame, create_video_source
+from src.output.gcp_outputs import BigQueryWriter, PubSubPublisher
+from src.tracking.tracker import ObjectTracker
+
+console = Console()
+
+
+class PipelineState(Enum):
+    """Pipeline state machine."""
+
+    INITIALIZING = "initializing"
+    WARMUP = "warmup"
+    CLUSTERING = "clustering"
+    RUNNING = "running"
+    STOPPED = "stopped"
+
+
+@dataclass
+class PipelineConfig:
+    """Configuration for the pipeline."""
+
+    # Video
+    video_source: str = ""
+    video_type: str = "auto"
+    target_resolution: tuple[int, int] = (1280, 720)  # Higher res for better detection
+    fps_limit: int = 10
+
+    # Detection
+    detector_model: str = "yolov8m.pt"  # Medium model for best accuracy
+    detection_confidence: float = 0.25  # Lower threshold to catch more vehicles
+    detection_classes: list[int] | None = None
+    min_box_area: int = 200  # Lower to detect distant vehicles
+
+    # Features
+    feature_model: str = "facebook/dinov2-base"
+    device: str = "cuda"
+
+    # Clustering
+    warmup_duration: int = 60  # seconds
+    min_samples: int = 50
+    cluster_algorithm: str = "hdbscan"
+    n_clusters: int | None = None
+    min_cluster_size: int = 100  # Larger = fewer, more distinct clusters
+    recluster_interval: int = 300  # seconds
+
+    # Tracking
+    max_track_age: int = 90  # Max frames to keep lost track (increased for fast vehicles)
+    min_hits: int = 1  # Min hits before track is confirmed (lowered for immediate display)
+    iou_threshold: float = 0.1  # IoU threshold for matching (lowered for fast-moving objects)
+
+    # Output
+    enable_display: bool = True
+    enable_pubsub: bool = False
+    pubsub_project: str = ""
+    pubsub_topic: str = "sosd-events"
+    enable_bigquery: bool = False
+    bigquery_dataset: str = "sosd"
+    bigquery_table: str = "tracking_events"
+    log_interval: int = 5
+
+    # Cluster labels (user-provided names)
+    cluster_labels: dict[int, str] = field(default_factory=dict)
+
+
+class Pipeline:
+    """Main SOSD pipeline."""
+
+    def __init__(self, config: PipelineConfig):
+        """Initialize the pipeline.
+
+        Args:
+            config: Pipeline configuration
+        """
+        self.config = config
+        self.state = PipelineState.INITIALIZING
+
+        # Components
+        self._video_source: BufferedVideoSource | None = None
+        self._detector: ObjectDetector | None = None
+        self._feature_extractor: DINOv2Extractor | None = None
+        self._feature_buffer: FeatureBuffer | None = None
+        self._clusterer: ObjectClusterer | None = None
+        self._tracker: ObjectTracker | None = None
+        self._flow_analyzer: FlowAnalyzer | None = None
+
+        # GCP outputs
+        self._pubsub: PubSubPublisher | None = None
+        self._bigquery: BigQueryWriter | None = None
+
+        # State
+        self._stop_event = Event()
+        self._start_time: float = 0
+        self._warmup_start: float = 0
+        self._last_cluster_time: float = 0
+        self._frame_count: int = 0
+        self._last_log_time: float = 0
+
+    def _init_components(self) -> None:
+        """Initialize all pipeline components."""
+        logger.info("Initializing pipeline components...")
+
+        # Video source
+        source = create_video_source(
+            self.config.video_source,
+            self.config.video_type,
+            self.config.target_resolution,
+            self.config.fps_limit,
+        )
+        self._video_source = BufferedVideoSource(source, buffer_size=30)
+
+        # Detector
+        self._detector = ObjectDetector(
+            model_name=self.config.detector_model,
+            confidence_threshold=self.config.detection_confidence,
+            classes=self.config.detection_classes,
+            min_box_area=self.config.min_box_area,
+            device=self.config.device,
+        )
+        self._detector.load()
+
+        # Feature extractor
+        self._feature_extractor = DINOv2Extractor(
+            model_name=self.config.feature_model,
+            device=self.config.device,
+        )
+        self._feature_extractor.load()
+
+        # Feature buffer for warmup
+        self._feature_buffer = FeatureBuffer(max_size=10000)
+
+        # Clusterer
+        self._clusterer = ObjectClusterer(
+            algorithm=self.config.cluster_algorithm,
+            n_clusters=self.config.n_clusters,
+            min_cluster_size=self.config.min_cluster_size,
+            min_samples=self.config.min_samples,
+        )
+
+        # Tracker
+        self._tracker = ObjectTracker(
+            max_age=self.config.max_track_age,
+            min_hits=self.config.min_hits,
+            iou_threshold=self.config.iou_threshold,
+        )
+
+        # Flow analyzer
+        self._flow_analyzer = FlowAnalyzer()
+
+        # GCP outputs
+        if self.config.enable_pubsub:
+            self._pubsub = PubSubPublisher(
+                self.config.pubsub_project,
+                self.config.pubsub_topic,
+            )
+            self._pubsub.connect()
+
+        if self.config.enable_bigquery:
+            self._bigquery = BigQueryWriter(
+                self.config.pubsub_project,
+                self.config.bigquery_dataset,
+                self.config.bigquery_table,
+            )
+            self._bigquery.connect()
+
+        logger.info("All components initialized")
+
+    def _process_frame(self, frame: Frame) -> dict[str, Any]:
+        """Process a single frame through the pipeline.
+
+        Args:
+            frame: Input video frame
+
+        Returns:
+            Processing results
+        """
+        self._frame_count += 1
+
+        # Detect objects
+        detections = self._detector.detect(frame)
+
+        if not detections:
+            # Still update tracker with empty detections to age out old tracks
+            tracks = self._tracker.update([], None, None, None)
+            return {"frame": frame, "detections": [], "tracks": tracks, "features": []}
+
+        # Log detection count periodically
+        if self._frame_count % 30 == 0:
+            logger.debug(f"Frame {self._frame_count}: {len(detections)} detections")
+
+        # Extract features
+        features = self._feature_extractor.extract(frame.image, detections)
+
+        # Get cluster labels if clusterer is fitted
+        cluster_labels = None
+        cluster_names = self.config.cluster_labels
+
+        if self._clusterer.is_fitted and features:
+            embeddings = np.vstack([f.embedding for f in features])
+            cluster_labels = self._clusterer.predict(embeddings)
+
+            # Build cluster name mapping
+            if self._clusterer.result:
+                for cid, info in self._clusterer.result.clusters.items():
+                    if cid not in cluster_names:
+                        cluster_names[cid] = info.label
+
+        # Update tracker
+        tracks = self._tracker.update(
+            detections,
+            features,
+            cluster_labels,
+            cluster_names,
+        )
+
+        # Update flow analytics
+        if self._flow_analyzer:
+            self._flow_analyzer.update(tracks, cluster_names)
+
+        # Write to GCP if enabled
+        if self._pubsub:
+            for track in tracks:
+                self._pubsub.publish_track_event("track_updated", track)
+
+        if self._bigquery:
+            for track in tracks:
+                self._bigquery.write_track(track)
+
+        return {
+            "frame": frame,
+            "detections": detections,
+            "features": features,
+            "tracks": tracks,
+            "cluster_labels": cluster_labels,
+        }
+
+    def _warmup_phase(self) -> bool:
+        """Run the warmup phase to collect data for clustering.
+
+        Returns:
+            True if warmup succeeded, False otherwise
+        """
+        logger.info(f"Starting warmup phase ({self.config.warmup_duration}s)...")
+        self.state = PipelineState.WARMUP
+        self._warmup_start = time.time()
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Warmup", total=self.config.warmup_duration)
+
+            while not self._stop_event.is_set():
+                elapsed = time.time() - self._warmup_start
+                progress.update(task, completed=min(elapsed, self.config.warmup_duration))
+
+                if elapsed >= self.config.warmup_duration:
+                    break
+
+                # Get frame
+                frame = self._video_source.read()
+                if frame is None:
+                    time.sleep(0.01)
+                    continue
+
+                # Detect and extract features
+                detections = self._detector.detect(frame)
+                if detections:
+                    features = self._feature_extractor.extract(frame.image, detections)
+                    self._feature_buffer.add(features)
+
+                # Show progress
+                if int(elapsed) % 5 == 0:
+                    progress.update(
+                        task,
+                        description=f"Warmup ({len(self._feature_buffer)} samples)",
+                    )
+
+        # Check if we have enough samples
+        if len(self._feature_buffer) < self.config.min_samples:
+            logger.warning(
+                f"Insufficient samples for clustering: {len(self._feature_buffer)} < {self.config.min_samples}"
+            )
+            return False
+
+        logger.info(f"Warmup complete with {len(self._feature_buffer)} samples")
+        return True
+
+    def _cluster_phase(self) -> bool:
+        """Run clustering on collected features.
+
+        Returns:
+            True if clustering succeeded
+        """
+        logger.info("Running unsupervised clustering...")
+        self.state = PipelineState.CLUSTERING
+
+        embeddings = self._feature_buffer.embeddings
+        result = self._clusterer.fit(embeddings)
+
+        if result.n_clusters == 0:
+            logger.error("Clustering failed - no clusters found")
+            return False
+
+        # Log cluster info
+        table = Table(title="Discovered Clusters")
+        table.add_column("ID")
+        table.add_column("Label")
+        table.add_column("Size")
+        table.add_column("Color")
+
+        for cid, info in result.clusters.items():
+            # Apply user labels if provided
+            if cid in self.config.cluster_labels:
+                info.label = self.config.cluster_labels[cid]
+
+            color_str = f"RGB{info.color}"
+            table.add_row(str(cid), info.label, str(info.size), color_str)
+
+        console.print(table)
+
+        self._last_cluster_time = time.time()
+        return True
+
+    def _display_frame(self, result: dict) -> None:
+        """Display annotated frame with tracking visualization."""
+        frame = result["frame"]
+        tracks = result.get("tracks", [])
+        detections = result.get("detections", [])
+
+        # Get cluster colors
+        cluster_colors = {}
+        if self._clusterer.result:
+            for cid, info in self._clusterer.result.clusters.items():
+                cluster_colors[cid] = info.color
+
+        # Draw on frame
+        annotated = frame.image.copy()
+
+        # Helper function to draw text with black outline
+        def draw_text_with_outline(img, text, pos, scale, color, thickness=2):
+            x, y = pos
+            # Draw black outline
+            cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 2)
+            # Draw colored text on top
+            cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
+
+        # Draw raw detections first (yellow boxes) - always visible
+        for det in detections:
+            x1, y1, x2, y2 = det.bbox
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 255), 2)  # Yellow
+
+        # Draw tracked objects on top (colored by cluster)
+        if tracks:
+            logger.debug(f"Drawing {len(tracks)} tracks")
+
+        for track in tracks:
+            x1, y1, x2, y2 = track.bbox
+            color = cluster_colors.get(track.cluster_id, (0, 255, 0))  # Default to green
+
+            # Draw box with thicker line
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
+
+            # Draw label with outline
+            label = f"{track.cluster_label} #{track.track_id}"
+            draw_text_with_outline(annotated, label, (x1, y1 - 10), 0.6, color)
+
+            # Draw trajectory
+            if len(track.positions) > 1:
+                pts = np.array(track.positions[-20:], dtype=np.int32)
+                cv2.polylines(annotated, [pts], False, color, 2)
+
+        # Add stats overlay with black outline
+        if self._flow_analyzer:
+            stats = self._flow_analyzer.get_flow_summary()
+            y_offset = 30
+            draw_text_with_outline(
+                annotated,
+                f"Active: {stats['active_tracks']} | Total: {stats['total_tracked']} | Detections: {len(detections)}",
+                (10, y_offset),
+                0.7,
+                (255, 255, 255),
+            )
+            y_offset += 30
+
+            for cluster_name, cluster_stats in stats.get("clusters", {}).items():
+                text = f"{cluster_name}: {cluster_stats['active']} active, {cluster_stats['total']} total ({cluster_stats['flow_rate']})"
+                draw_text_with_outline(annotated, text, (10, y_offset), 0.5, (255, 255, 255))
+                y_offset += 22
+
+        cv2.imshow("SOSD - Object Flow Tracker", annotated)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            self._stop_event.set()
+
+    def _log_stats(self) -> None:
+        """Log current statistics."""
+        if self._flow_analyzer:
+            stats = self._flow_analyzer.get_flow_summary()
+            logger.info(
+                f"[{stats['elapsed_time']:.0f}s] "
+                f"Active: {stats['active_tracks']} | "
+                f"Total: {stats['total_tracked']} | "
+                f"Clusters: {stats['clusters']}"
+            )
+
+            # Publish stats to Pub/Sub
+            if self._pubsub and self._flow_analyzer:
+                self._pubsub.publish_stats(self._flow_analyzer.get_all_stats())
+
+    def run(self) -> None:
+        """Run the main pipeline loop."""
+        try:
+            # Initialize
+            self._init_components()
+
+            # Start video source
+            if not self._video_source.start():
+                logger.error("Failed to start video source")
+                return
+
+            self._start_time = time.time()
+
+            # Warmup phase
+            if not self._warmup_phase():
+                logger.error("Warmup phase failed")
+                return
+
+            # Clustering phase
+            if not self._cluster_phase():
+                logger.error("Clustering phase failed")
+                return
+
+            # Main processing loop
+            self.state = PipelineState.RUNNING
+            logger.info("Pipeline running - press 'q' to stop")
+
+            while not self._stop_event.is_set():
+                frame = self._video_source.read()
+                if frame is None:
+                    time.sleep(0.01)
+                    continue
+
+                # Process frame
+                result = self._process_frame(frame)
+
+                # Display if enabled
+                if self.config.enable_display:
+                    self._display_frame(result)
+
+                # Periodic logging
+                current_time = time.time()
+                if current_time - self._last_log_time >= self.config.log_interval:
+                    self._log_stats()
+                    self._last_log_time = current_time
+
+                # Periodic re-clustering
+                if (
+                    self.config.recluster_interval > 0
+                    and current_time - self._last_cluster_time >= self.config.recluster_interval
+                ):
+                    logger.info("Re-clustering with updated data...")
+                    embeddings = self._feature_buffer.embeddings
+                    if len(embeddings) >= self.config.min_samples:
+                        self._clusterer.fit(embeddings)
+                        self._last_cluster_time = current_time
+
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user")
+
+        finally:
+            self.stop()
+
+    def stop(self) -> None:
+        """Stop the pipeline."""
+        logger.info("Stopping pipeline...")
+        self._stop_event.set()
+        self.state = PipelineState.STOPPED
+
+        if self._video_source:
+            self._video_source.stop()
+
+        if self._pubsub:
+            self._pubsub.close()
+
+        if self._bigquery:
+            self._bigquery.close()
+
+        if self.config.enable_display:
+            cv2.destroyAllWindows()
+
+        # Final stats
+        if self._flow_analyzer:
+            final_stats = self._flow_analyzer.get_flow_summary()
+            console.print(Panel.fit(
+                f"[bold]Final Statistics[/bold]\n\n"
+                f"Total Runtime: {final_stats['elapsed_time']:.1f}s\n"
+                f"Total Objects Tracked: {final_stats['total_tracked']}\n"
+                f"Frames Processed: {self._frame_count}",
+                title="SOSD Pipeline Complete",
+            ))
+
+        logger.info("Pipeline stopped")
+
+
+def main():
+    """CLI entry point."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="SOSD - Semantic Object Stream Discovery")
+    parser.add_argument("source", help="Video source (URL, file path, or webcam index)")
+    parser.add_argument("--type", default="auto", choices=["auto", "rtsp", "hls", "youtube", "file", "webcam"])
+    parser.add_argument("--warmup", type=int, default=60, help="Warmup duration in seconds")
+    parser.add_argument("--clusters", type=int, default=None, help="Number of clusters (None=auto)")
+    parser.add_argument("--min-cluster-size", type=int, default=100, help="Min samples per cluster (higher=fewer clusters)")
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu", "mps"])
+    parser.add_argument("--no-display", action="store_true", help="Disable display window")
+    parser.add_argument("--detector", default="yolov8m.pt", help="YOLO model (yolov8n/s/m/l/x.pt)")
+    parser.add_argument("--vehicles-only", action="store_true", help="Only detect vehicles")
+
+    args = parser.parse_args()
+
+    # Build config
+    config = PipelineConfig(
+        video_source=args.source,
+        video_type=args.type,
+        warmup_duration=args.warmup,
+        n_clusters=args.clusters,
+        min_cluster_size=args.min_cluster_size,
+        device=args.device,
+        enable_display=not args.no_display,
+        detector_model=args.detector,
+        detection_classes=[2, 3, 5, 7] if args.vehicles_only else None,  # COCO vehicle classes
+    )
+
+    # Setup signal handlers
+    pipeline = Pipeline(config)
+
+    def signal_handler(sig, frame):
+        logger.info("Received shutdown signal")
+        pipeline.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # Run
+    pipeline.run()
+
+
+if __name__ == "__main__":
+    main()
