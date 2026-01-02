@@ -67,6 +67,7 @@ from src.detection.detector import ObjectDetector
 from src.features.extractor import DINOv2Extractor, FeatureBuffer
 from src.ingestion.video_source import BufferedVideoSource, Frame, create_video_source
 from src.output.gcp_outputs import BigQueryWriter, PubSubPublisher
+from src.output.visualizer import ClusterVisualizer
 from src.tracking.tracker import ObjectTracker
 
 console = Console()
@@ -220,6 +221,9 @@ class Pipeline:
         self._pubsub: PubSubPublisher | None = None
         self._bigquery: BigQueryWriter | None = None
         
+        # Visualization
+        self._cluster_visualizer: ClusterVisualizer | None = None
+        
         # Async processing
         self._executor: ThreadPoolExecutor | None = None
         self._process_executor: ProcessPoolExecutor | None = None
@@ -301,13 +305,15 @@ class Pipeline:
             )
             self._pubsub.connect()
 
-        if self.config.enable_bigquery:
             self._bigquery = BigQueryWriter(
                 self.config.pubsub_project,
                 self.config.bigquery_dataset,
                 self.config.bigquery_table,
             )
             self._bigquery.connect()
+            
+        # Visualizer
+        self._cluster_visualizer = ClusterVisualizer(width=600, height=600)
 
         logger.info("All components initialized")
         self._process_interval = 1.0 / self.config.processing_fps
@@ -570,6 +576,12 @@ class Pipeline:
                 y_offset += 22
 
         cv2.imshow("SOSD - Object Flow Tracker", annotated)
+        
+        # Draw and show cluster visualizer
+        if self._cluster_visualizer:
+            viz_img = self._cluster_visualizer.draw(self._clusterer.result)
+            cv2.imshow("SOSD - Clusters", viz_img)
+
         if cv2.waitKey(1) & 0xFF == ord("q"):
             self._stop_event.set()
 
