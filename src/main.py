@@ -2,6 +2,18 @@
 
 from __future__ import annotations
 
+import os
+
+# CRITICAL: Limit threads to prevent CPU starvation by background processes
+# This must be set BEFORE numpy/cv2/sklearn are imported
+# We enforce this globally to ensure the video player (UI thread) is never starved
+# by heavy math operations in background threads/processes.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import signal
 import sys
 import time
@@ -13,14 +25,7 @@ from typing import Any
 import cv2
 import numpy as np
 from loguru import logger
-from concurrent.futures import ThreadPoolExecutor, Future
-import os
-
-# Suppress FFMPEG logs
-os.environ["OPENCV_LOG_LEVEL"] = "OFF"
-os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "0"
-os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
-os.environ["OPENCV_VIDEOCAPTURE_DEBUG"] = "0"
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, Future
 import warnings
 warnings.filterwarnings("ignore", message=".*n_jobs value 1 overridden.*")
 
@@ -125,6 +130,71 @@ class PipelineConfig:
     cluster_labels: dict[int, str] = field(default_factory=dict)
 
 
+def run_clustering_job(config: dict, embeddings: np.ndarray) -> Any:
+    """Run clustering in a separate process (Stateless).
+    
+    Args:
+        config: Dictionary of clustering parameters
+        embeddings: Numpy array of embeddings
+        
+    Returns:
+        ClusterResult object (lightweight dataclass)
+    """
+    import os
+    import psutil
+    from src.clustering.clusterer import ObjectClusterer
+    
+    # CRITICAL: Lower process priority to ensure Video/UI thread is never starved
+    try:
+        p = psutil.Process(os.getpid())
+        p.nice(psutil.IDLE_PRIORITY_CLASS)
+    except Exception as e:
+        logger.warning(f"Failed to lower process priority: {e}")
+
+    # Enforce limits again just to be safe in this process
+    os.environ["OMP_NUM_THREADS"] = "1"
+    
+    logger.info(f"Starting clustering process for {len(embeddings)} samples...")
+    
+    # Reconstruct clusterer from config
+    clusterer = ObjectClusterer(**config)
+    result = clusterer.fit(embeddings)
+    
+    # Return everything needed to sync state
+    return {
+        "result": result,
+        "scaler": clusterer._scaler,
+        "pca_model": clusterer._pca_model,
+        "cluster_model": clusterer._cluster_model if clusterer.algorithm != clusterer.algorithm.HDBSCAN else None 
+        # Note: HDBSCAN model might be heavy or complex to pickle, but often fine. 
+        # If it fails, we fall back to centroid matching which only needs 'result'.
+        # For now, let's NOT return HDBSCAN object to keep it light/safe, 
+        # relying on centroid prediction (which is robust).
+    }
+
+
+def warmup_worker() -> bool:
+    """Pre-load heavy libraries only (imports only)."""
+    import os
+    # Limit threads just in case
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    
+    try:
+        import numpy as np
+        import sklearn.cluster
+        import sklearn.preprocessing
+        from sklearn.decomposition import PCA
+        try:
+            import hdbscan
+        except ImportError:
+            pass
+            
+        return True
+    except ImportError:
+        return False
+
+
 class Pipeline:
     """Main SOSD pipeline."""
 
@@ -152,7 +222,9 @@ class Pipeline:
         
         # Async processing
         self._executor: ThreadPoolExecutor | None = None
+        self._process_executor: ProcessPoolExecutor | None = None
         self._future: Future | None = None
+        self._clustering_future: Future | None = None
 
         # State
         self._stop_event = Event()
@@ -163,7 +235,9 @@ class Pipeline:
         self._frame_count: int = 0
         self._last_log_time: float = 0
         self._last_process_time: float = 0
+        self._last_process_time: float = 0
         self._process_interval: float = 0
+        self._last_detections: list = []
 
     def _init_components(self) -> None:
         """Initialize all pipeline components."""
@@ -199,11 +273,14 @@ class Pipeline:
         self._feature_buffer = FeatureBuffer(max_size=10000)
 
         # Clusterer
+        # Clusterer
         self._clusterer = ObjectClusterer(
             algorithm=self.config.cluster_algorithm,
             n_clusters=self.config.n_clusters,
             min_cluster_size=self.config.min_cluster_size,
             min_samples=self.config.min_samples,
+            use_pca=True,
+            pca_n_components=32
         )
 
         # Tracker
@@ -237,7 +314,15 @@ class Pipeline:
 
         logger.info("All components initialized")
         self._process_interval = 1.0 / self.config.processing_fps
+        self._process_interval = 1.0 / self.config.processing_fps
+        # Use 1 worker for detection thread
         self._executor = ThreadPoolExecutor(max_workers=1)
+        # Use 1 process for heavy clustering
+        self._process_executor = ProcessPoolExecutor(max_workers=1)
+        
+        # Pre-warm the process pool to absorb import overhead
+        logger.info("Pre-warming background process pool...")
+        self._process_executor.submit(warmup_worker)
 
     def _run_detection(self, frame: Frame) -> tuple[Frame, list, list, np.ndarray | None, dict]:
         """Run heavy detection task in background."""
@@ -342,6 +427,16 @@ class Pipeline:
                         description=f"Warmup ({len(self._feature_buffer)} samples)",
                     )
 
+                # Visualize
+                if self.config.enable_display:
+                    display_result = {
+                        "frame": frame,
+                        "detections": detections,
+                        "tracks": [],
+                        "is_warmup": True
+                    }
+                    self._display_frame(display_result)
+
         # Check if we have enough samples
         if len(self._feature_buffer) < self.config.min_samples:
             logger.warning(
@@ -352,42 +447,41 @@ class Pipeline:
         logger.info(f"Warmup complete with {len(self._feature_buffer)} samples")
         return True
 
-    def _cluster_phase(self) -> bool:
-        """Run clustering on collected features.
-
-        Returns:
-            True if clustering succeeded
-        """
-        logger.info("Running unsupervised clustering...")
-        self.state = PipelineState.CLUSTERING
-
+    def _perform_clustering_task(self) -> None:
+        """Submit clustering task to background process."""
+        logger.info("Submitting background unsupervised clustering...")
+        
         embeddings = self._feature_buffer.embeddings
-        result = self._clusterer.fit(embeddings)
+        logger.info(f"Buffer size: {len(embeddings)}")
+        
+        # Downsample if too large to ensure constant-time clustering (~1-2s max)
+        # This prevents the "60s warmup" pause issue.
+        MAX_SAMPLES = 5000
+        if len(embeddings) > MAX_SAMPLES:
+            logger.info(f"Downsampling clustering input: {len(embeddings)} -> {MAX_SAMPLES}")
+            # Use random sampling
+            indices = np.random.choice(len(embeddings), MAX_SAMPLES, replace=False)
+            embeddings = embeddings[indices]
+            logger.info("Downsampling complete.")
+            
+        # This avoids pickling the heavy ObjectClusterer instance
+        config = {
+            "algorithm": self._clusterer.algorithm.value,
+            "n_clusters": self._clusterer.n_clusters,
+            "min_cluster_size": self._clusterer.min_cluster_size,
+            "use_pca": self._clusterer.use_pca,
+            "pca_n_components": self._clusterer.pca_n_components,
+            "min_samples": self._clusterer.min_samples,
+        }
 
-        if result.n_clusters == 0:
-            logger.warning("Clustering failed - no clusters found. Continuing with generic tracking.")
-            # Set a default cluster? or just rely on cid=-1 (noise)
-            return True # Continue anyway
+        # We submit config AND embeddings to the process
+        logger.info(f"Submitting {len(embeddings)} samples to background process...")
+        self._clustering_future = self._process_executor.submit(
+            run_clustering_job, 
+            config, 
+            embeddings
+        )
 
-        # Log cluster info
-        table = Table(title="Discovered Clusters")
-        table.add_column("ID")
-        table.add_column("Label")
-        table.add_column("Size")
-        table.add_column("Color")
-
-        for cid, info in result.clusters.items():
-            # Apply user labels if provided
-            if cid in self.config.cluster_labels:
-                info.label = self.config.cluster_labels[cid]
-
-            color_str = f"RGB{info.color}"
-            table.add_row(str(cid), info.label, str(info.size), color_str)
-
-        console.print(table)
-
-        self._last_cluster_time = time.time()
-        return True
 
     def _display_frame(self, result: dict) -> None:
         """Display annotated frame with tracking visualization."""
@@ -412,7 +506,18 @@ class Pipeline:
             # Draw colored text on top
             cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
 
-        # Draw raw detections first (yellow boxes) - always visible
+        # Draw raw detections first (yellow boxes)
+        # Only draw if we don't have active tracks to avoid double-box clutter
+        # or if we are in warmup where tracks don't exist yet.
+        if not tracks:
+            for det in detections:
+                x1, y1, x2, y2 = det.bbox
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 255), 1)
+
+        # Draw Warmup Overlay if needed
+        if result.get("is_warmup", False):
+            cv2.putText(annotated, "WARMUP PHASE - COLLECTING SAMPLES", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+            cv2.putText(annotated, f"Samples: {len(self._feature_buffer)}/{self.config.min_samples}", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
 
         # Draw tracked objects on top (colored by cluster)
@@ -502,9 +607,12 @@ class Pipeline:
                 return
 
             # Clustering phase
-            if not self._cluster_phase():
-                logger.warning("Clustering phase incomplete - proceeding with generic tracking")
-                # return # Do not return, continue processing
+            # Clustering phase (Background)
+            if len(self._feature_buffer) >= self.config.min_samples:
+                logger.info("Starting processing... Clustering will happen in background process")
+                self._perform_clustering_task()
+            else:
+                 logger.warning("Insufficient samples for clustering - generic tracking only")
 
             # Main processing loop
             self.state = PipelineState.RUNNING
@@ -535,12 +643,41 @@ class Pipeline:
                         delay = frame.frame_number - p_frame.frame_number
                         self._update_tracker(p_frame, p_dets, p_feats, p_labels, p_names, delay)
                         
+                        # Store for persistent display
+                        self._last_detections = p_dets
+
                         # Get updated tracks after correction
                         tracks = self._tracker.tracks
                         self._future = None
                     except Exception as e:
                         logger.error(f"Detection task failed: {e}")
                         self._future = None
+
+                # Check clustering completion
+                if self._clustering_future and self._clustering_future.done():
+                    try:
+                        # Value returned is now a dict with state
+                        ret = self._clustering_future.result()
+                        cluster_result = ret["result"]
+                        
+                        logger.info("Background clustering process complete!")
+                        
+                        # Apply result AND MODELS to our local clusterer
+                        # This enables predict() to work correctly
+                        self._clusterer._last_result = cluster_result
+                        self._clusterer._scaler = ret["scaler"]
+                        self._clusterer._pca_model = ret["pca_model"]
+                        # We don't sync hdbscan object to avoid issues, we use centroid prediction
+                        
+                        self._clusterer._fitted = True
+                        
+                        # Print generic info
+                        if cluster_result:
+                             logger.info(f"Clustering finished: {cluster_result.n_clusters} clusters found.")
+                        
+                    except Exception as e:
+                        logger.error(f"Clustering process failed: {e}")
+                    self._clustering_future = None
 
                 # 3. Submit new task if idle and interval elapsed
                 if self._future is None and (current_time - self._last_process_time) >= self._process_interval:
@@ -553,11 +690,11 @@ class Pipeline:
                 # 4. Display
                 if self.config.enable_display:
                     # We display the CURRENT frame with the TRACKS (which might be predicted or updated)
-                     # We display the CURRENT frame with the TRACKS (which might be predicted or updated)
+                    # Use last known detections for display to avoid empty boxes/flickering
                     display_result = {
                         "frame": frame,
                         "tracks": tracks,
-                        "detections": [] # Pass empty detections for display stats
+                        "detections": self._last_detections
                     }
                     self._display_frame(display_result)
 
@@ -573,10 +710,10 @@ class Pipeline:
                     self.config.recluster_interval > 0
                     and current_time - self._last_cluster_time >= self.config.recluster_interval
                 ):
-                    logger.info("Re-clustering with updated data...")
-                    embeddings = self._feature_buffer.embeddings
-                    if len(embeddings) >= self.config.min_samples:
-                        self._clusterer.fit(embeddings)
+                    # Only submit if not already running
+                    if self._clustering_future is None:
+                        logger.info("Triggering periodic re-clustering (background)...")
+                        self._perform_clustering_task()
                         self._last_cluster_time = current_time
 
         except KeyboardInterrupt:
@@ -602,6 +739,9 @@ class Pipeline:
 
         if self._executor:
             self._executor.shutdown(wait=False)
+            
+        if self._process_executor:
+            self._process_executor.shutdown(wait=False)
 
         if self.config.enable_display:
             cv2.destroyAllWindows()
@@ -634,7 +774,7 @@ def main():
     parser.add_argument("--no-display", action="store_true", help="Disable display window")
     parser.add_argument("--detector", default="yolov8m.pt", help="YOLO model (yolov8n/s/m/l/x.pt)")
     parser.add_argument("--vehicles-only", action="store_true", help="Only detect vehicles")
-    parser.add_argument("--processing-fps", type=int, default=25, help="FPS limit for detection/processing")
+    parser.add_argument("--processing-fps", type=int, default=-1, help="FPS limit for detection/processing")
     parser.add_argument("--display-fps", type=int, default=-1, help="Target FPS for display (default=-1 for auto/source FPS)")
 
     args = parser.parse_args()
