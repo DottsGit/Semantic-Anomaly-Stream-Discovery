@@ -1,6 +1,6 @@
 # Semantic Object Stream Discovery
 
-![Banner](docs/images/banner.png)
+![Banner](src/assets/SOSD_Banner.png)
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
