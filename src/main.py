@@ -63,6 +63,7 @@ from rich.table import Table
 
 from src.analytics.flow_analyzer import FlowAnalyzer
 from src.clustering.clusterer import ObjectClusterer
+from src.clustering.class_aware_clusterer import ClassAwareClusterer, get_class_color
 from src.detection.detector import ObjectDetector
 from src.features.extractor import DINOv2Extractor, FeatureBuffer
 from src.ingestion.video_source import BufferedVideoSource, Frame, create_video_source
@@ -258,7 +259,8 @@ class Pipeline:
         self._detector: ObjectDetector | None = None
         self._feature_extractor: DINOv2Extractor | None = None
         self._feature_buffer: FeatureBuffer | None = None
-        self._clusterer: ObjectClusterer | None = None
+        self._clusterer: ObjectClusterer | None = None  # Legacy global clusterer (for backward compat)
+        self._class_aware_clusterer: ClassAwareClusterer | None = None  # Per-class clustering
         self._tracker: ObjectTracker | None = None
         self._flow_analyzer: FlowAnalyzer | None = None
 
@@ -322,8 +324,7 @@ class Pipeline:
         # Feature buffer for warmup
         self._feature_buffer = FeatureBuffer(max_size=self.config.max_buffer_size)
 
-        # Clusterer
-        # Clusterer
+        # Legacy Clusterer (kept for backward compatibility / autotune)
         self._clusterer = ObjectClusterer(
             algorithm=self.config.cluster_algorithm,
             n_clusters=self.config.n_clusters,
@@ -332,6 +333,17 @@ class Pipeline:
             use_pca=True,
             pca_n_components=self.config.pca_n_components,
             cluster_scale=self.config.min_cluster_scale
+        )
+        
+        # Per-class clusterer (primary clustering mechanism)
+        self._class_aware_clusterer = ClassAwareClusterer(
+            min_samples_percentage=0.05,  # 5% of total samples
+            min_samples_absolute=15,  # Absolute minimum floor
+            algorithm=self.config.cluster_algorithm,
+            min_cluster_size=self.config.min_cluster_size,
+            use_pca=True,
+            pca_n_components=self.config.pca_n_components,
+            cluster_scale=self.config.min_cluster_scale,
         )
 
         # Tracker
@@ -377,33 +389,48 @@ class Pipeline:
         logger.info("Pre-warming background process pool...")
         self._process_executor.submit(warmup_worker)
 
-    def _run_detection(self, frame: Frame) -> tuple[Frame, list, list, np.ndarray | None, dict]:
-        """Run heavy detection task in background."""
+    def _run_detection(self, frame: Frame) -> tuple[Frame, list, list, list | None, dict]:
+        """Run heavy detection task in background.
+        
+        Returns:
+            tuple of (frame, detections, features, class_predictions, cluster_names)
+            where class_predictions is a list of ClassPrediction objects
+        """
         detections = self._detector.detect(frame)
         
         features = []
         if detections:
             features = self._feature_extractor.extract(frame.image, detections)
             
-        cluster_labels = None
-        cluster_names = self.config.cluster_labels.copy() # Safe copy
+        class_predictions = None
+        cluster_names = self.config.cluster_labels.copy()  # Safe copy
         
-        if self._clusterer.is_fitted and features:
-            embeddings = np.vstack([f.embedding for f in features])
-            cluster_labels = self._clusterer.predict(embeddings)
-            
-            # We can't access result.clusters safely if it changes, but reading is mostly fine
-            # For strict safety we might need a lock, but let's assume atomic replace
-            if self._clusterer.result:
-                for cid, info in self._clusterer.result.clusters.items():
-                   if cid not in cluster_names:
-                        cluster_names[cid] = info.label
+        # Use class-aware clusterer if fitted
+        if self._class_aware_clusterer and self._class_aware_clusterer.is_fitted and features:
+            class_predictions = []
+            for feat in features:
+                class_name = feat.detection.class_name
+                pred = self._class_aware_clusterer.predict(class_name, feat.embedding)
+                class_predictions.append(pred)
+                
+                # Build cluster names for display
+                if pred.cluster_id >= 0 and pred.cluster_id not in cluster_names:
+                    cluster_names[pred.cluster_id] = pred.cluster_label
 
-        return frame, detections, features, cluster_labels, cluster_names
+        return frame, detections, features, class_predictions, cluster_names
 
-    def _update_tracker(self, frame: Frame, detections: list, features: list, cluster_labels: Any, cluster_names: dict, delay: int = 0) -> dict:
-        """Update tracker with results from background task."""
-        self._frame_count += 1 # Note: This might jump if we rely on this for "processed" count
+    def _update_tracker(self, frame: Frame, detections: list, features: list, class_predictions: list | None, cluster_names: dict, delay: int = 0) -> dict:
+        """Update tracker with results from background task.
+        
+        Args:
+            class_predictions: List of ClassPrediction objects from class-aware clusterer
+        """
+        self._frame_count += 1
+        
+        # Convert class_predictions to cluster_labels format for tracker compatibility
+        cluster_labels = None
+        if class_predictions:
+            cluster_labels = np.array([p.cluster_id for p in class_predictions])
         
         # Update tracker
         tracks = self._tracker.update(  
@@ -413,6 +440,18 @@ class Pipeline:
             cluster_names,
             delay_frames=delay,
         )
+        
+        # Update track anomaly status using per-track prediction
+        # Each track gets its own prediction based on its embedding and class
+        if self._class_aware_clusterer and self._class_aware_clusterer.is_fitted:
+            for track in tracks:
+                if track.mean_embedding is not None and track.yolo_class_name:
+                    pred = self._class_aware_clusterer.predict(
+                        track.yolo_class_name, 
+                        track.mean_embedding
+                    )
+                    track.is_anomaly = pred.is_anomaly
+                    track.cluster_label = pred.cluster_label
 
         # Update flow analytics
         if self._flow_analyzer:
@@ -432,7 +471,7 @@ class Pipeline:
             "detections": detections,
             "features": features,
             "tracks": tracks,
-            "cluster_labels": cluster_labels,
+            "class_predictions": class_predictions,
         }
 
     def _warmup_phase(self) -> bool:
@@ -501,49 +540,36 @@ class Pipeline:
         return True
 
     def _perform_clustering_task(self) -> None:
-        """Submit clustering task to background process."""
-        logger.info("Submitting background unsupervised clustering...")
+        """Submit clustering task to run per-class clustering."""
+        logger.info("Starting per-class clustering...")
         
-        embeddings = self._feature_buffer.embeddings
-        logger.info(f"Buffer size: {len(embeddings)}")
+        # Get embeddings grouped by class
+        embeddings_by_class = self._feature_buffer.get_embeddings_by_class()
+        class_counts = self._feature_buffer.get_class_counts()
         
-        # Downsample if too large to ensure constant-time clustering (~1-2s max)
-        # This prevents the "60s warmup" pause issue.
-        MAX_SAMPLES = 5000
-        if len(embeddings) > MAX_SAMPLES:
-            logger.info(f"Downsampling clustering input: {len(embeddings)} -> {MAX_SAMPLES}")
-            # Use random sampling
-            indices = np.random.choice(len(embeddings), MAX_SAMPLES, replace=False)
-            embeddings = embeddings[indices]
-            logger.info("Downsampling complete.")
-        if self.config.auto_tune and not self._tuned:
-            logger.info("Auto-tuning enabled: Starting grid search...")
-            logger.info(f"Submitting {len(embeddings)} samples to autotune process...")
-            self._clustering_future = self._process_executor.submit(
-                run_autotune_job, 
-                embeddings
-            )
-        else:
-            # Standard Clustering
+        logger.info(f"Classes collected: {class_counts}")
+        
+        # Log per-class sample counts
+        for cls_name, count in sorted(class_counts.items(), key=lambda x: -x[1]):
+            logger.info(f"  {cls_name}: {count} samples")
+        
+        # Per-class clustering is relatively fast, so we do it synchronously
+        # rather than in a background process (avoids pickle complexity)
+        if embeddings_by_class:
+            result = self._class_aware_clusterer.fit(embeddings_by_class)
             
-            # This avoids pickling the heavy ObjectClusterer instance
-            config = {
-                "algorithm": self._clusterer.algorithm.value,
-                "n_clusters": self._clusterer.n_clusters,
-                "min_cluster_size": self._clusterer.min_cluster_size,
-                "use_pca": self._clusterer.use_pca,
-                "pca_n_components": self.config.pca_n_components,
-                "min_samples": self._clusterer.min_samples,
-                "cluster_scale": self._clusterer.cluster_scale,
-            }
-
-            # We submit config AND embeddings to the process
-            logger.info(f"Submitting {len(embeddings)} samples to background process...")
-            self._clustering_future = self._process_executor.submit(
-                run_clustering_job, 
-                config, 
-                embeddings
-            )
+            if result.total_clusters > 0:
+                logger.info(
+                    f"Per-class clustering complete: {result.total_clusters} clusters "
+                    f"across {len(result.clustered_classes)} classes"
+                )
+                
+                # Reassign existing tracks to new clusters
+                self._reassign_track_clusters()
+            else:
+                logger.warning("No clusters found in any class")
+        else:
+            logger.warning("No embeddings to cluster")
         
         self._last_cluster_time = time.time()
 
@@ -554,26 +580,16 @@ class Pipeline:
         tracks = result.get("tracks", [])
         detections = result.get("detections", [])
 
-        # Get cluster colors
-        cluster_colors = {}
-        if self._clusterer.result:
-            for cid, info in self._clusterer.result.clusters.items():
-                cluster_colors[cid] = info.color
-
         # Draw on frame
         annotated = frame.image.copy()
 
         # Helper function to draw text with black outline
         def draw_text_with_outline(img, text, pos, scale, color, thickness=2):
             x, y = pos
-            # Draw black outline
             cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 2)
-            # Draw colored text on top
             cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
 
         # Draw raw detections first (yellow boxes)
-        # Only draw if we don't have active tracks to avoid double-box clutter
-        # or if we are in warmup where tracks don't exist yet.
         if not tracks:
             for det in detections:
                 x1, y1, x2, y2 = det.bbox
@@ -581,58 +597,99 @@ class Pipeline:
 
         # Draw Warmup Overlay if needed
         if result.get("is_warmup", False):
-            cv2.putText(annotated, "WARMUP PHASE - COLLECTING SAMPLES", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-            cv2.putText(annotated, f"Samples: {len(self._feature_buffer)}/{self.config.min_samples}", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            # Draw semi-transparent overlay at top
+            overlay = annotated.copy()
+            cv2.rectangle(overlay, (20, 20), (400, 180), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, annotated, 0.4, 0, annotated)
+            
+            # Title
+            draw_text_with_outline(annotated, "WARMUP PHASE", (30, 50), 0.9, (0, 150, 255))
+            
+            # Sample counts
+            class_counts = self._feature_buffer.get_class_counts()
+            total = len(self._feature_buffer)
+            draw_text_with_outline(annotated, f"Total: {total}", (30, 85), 0.7, (255, 255, 255))
+            
+            # Per-class counts (top 4 only)
+            y_pos = 115
+            for cls_name, count in sorted(class_counts.items(), key=lambda x: -x[1])[:4]:
+                color = get_class_color(cls_name)
+                draw_text_with_outline(annotated, f"{cls_name}: {count}", (40, y_pos), 0.5, color, 1)
+                y_pos += 20
 
 
-        # Draw tracked objects on top (colored by cluster)
-        if tracks:
-            logger.debug(f"Drawing {len(tracks)} tracks")
-
+        # Draw tracked objects (colored by class - ALWAYS use class colors for consistency)
         for track in tracks:
-            # Skip unconfirmed tracks (filtering phantom objects)
             if track.hit_streak < self.config.min_hits:
                 continue
 
             x1, y1, x2, y2 = track.bbox
-            cid = track.stable_cluster_id
-            color = cluster_colors.get(cid, (0, 255, 0))  # Default to green
-
-            # Draw box with thicker line
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
-
-            # Draw label with outline
-            c_label = track.cluster_label
-            if cid in self.config.cluster_labels:
-                c_label = self.config.cluster_labels[cid]
-            elif self._clusterer.result and cid in self._clusterer.result.clusters:
-                c_label = self._clusterer.result.clusters[cid].label
             
-            label = f"{c_label} #{track.track_id}"
-            draw_text_with_outline(annotated, label, (x1, y1 - 10), 0.6, color)
+            # ALWAYS use class-based coloring for consistency
+            color = get_class_color(track.yolo_class_name or "unknown", is_anomaly=track.is_anomaly)
 
-            # Draw trajectory
+            # Draw box (thicker for anomalies)
+            box_thickness = 4 if track.is_anomaly else 3
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, box_thickness)
+
+            # Label: class name or "class (anomaly)"
+            label = track.cluster_label if track.cluster_label and track.cluster_label != "Unknown" else track.yolo_class_name
+            display_label = f"{label} #{track.track_id}"
+            draw_text_with_outline(annotated, display_label, (x1, y1 - 10), 0.6, color)
+
+            # Trajectory
             if len(track.positions) > 1:
                 pts = np.array(track.positions[-20:], dtype=np.int32)
                 cv2.polylines(annotated, [pts], False, color, 2)
 
-        # Add stats overlay with black outline
-        if self._flow_analyzer:
+        # Add stats overlay (skip during warmup to avoid clutter)
+        if self._flow_analyzer and not result.get("is_warmup", False):
             stats = self._flow_analyzer.get_flow_summary()
             y_offset = 30
             draw_text_with_outline(
                 annotated,
-                f"Active: {stats['active_tracks']} | Total: {stats['total_tracked']} | Detections: {len(detections)}",
+                f"Active: {stats['active_tracks']} | Total: {stats['total_tracked']}",
                 (10, y_offset),
                 0.7,
                 (255, 255, 255),
             )
             y_offset += 30
 
+            # Aggregate stats by base class (combine normal and anomaly counts)
+            class_stats_aggregated = {}
             for cluster_name, cluster_stats in stats.get("clusters", {}).items():
-                text = f"{cluster_name}: {cluster_stats['active']} active, {cluster_stats['total']} total ({cluster_stats['flow_rate']})"
-                draw_text_with_outline(annotated, text, (10, y_offset), 0.5, (255, 255, 255))
-                y_offset += 22
+                # Extract base class name
+                base_class = cluster_name.replace(" (anomaly)", "")
+                is_anomaly = "(anomaly)" in cluster_name
+                
+                if base_class not in class_stats_aggregated:
+                    class_stats_aggregated[base_class] = {"normal": 0, "anomaly": 0}
+                
+                if is_anomaly:
+                    class_stats_aggregated[base_class]["anomaly"] += cluster_stats['active']
+                else:
+                    class_stats_aggregated[base_class]["normal"] += cluster_stats['active']
+            
+            # Draw table header
+            draw_text_with_outline(annotated, "Class", (10, y_offset), 0.45, (200, 200, 200), 1)
+            draw_text_with_outline(annotated, "Det", (120, y_offset), 0.45, (200, 200, 200), 1)
+            draw_text_with_outline(annotated, "Anom", (170, y_offset), 0.45, (200, 200, 200), 1)
+            y_offset += 20
+            
+            # Draw per-class row
+            for base_class, counts in sorted(class_stats_aggregated.items(), key=lambda x: -(x[1]["normal"] + x[1]["anomaly"])):
+                color = get_class_color(base_class, is_anomaly=False)
+                anomaly_color = get_class_color(base_class, is_anomaly=True)
+                
+                # Class name
+                draw_text_with_outline(annotated, base_class[:12], (10, y_offset), 0.45, color, 1)
+                # Normal count
+                draw_text_with_outline(annotated, str(counts["normal"]), (120, y_offset), 0.45, color, 1)
+                # Anomaly count (show in anomaly color if > 0)
+                anom_str = str(counts["anomaly"]) if counts["anomaly"] > 0 else "-"
+                anom_color = anomaly_color if counts["anomaly"] > 0 else (100, 100, 100)
+                draw_text_with_outline(annotated, anom_str, (170, y_offset), 0.45, anom_color, 1)
+                y_offset += 18
 
         cv2.imshow("SOSD - Object Flow Tracker", annotated)
         
@@ -645,47 +702,46 @@ class Pipeline:
             self._stop_event.set()
 
     def _reassign_track_clusters(self) -> None:
-        """Update cluster assignments for all active tracks using the new model.
+        """Update cluster assignments for all active tracks using the per-class model.
 
         This is critical when re-clustering happens: old cluster IDs become invalid,
-        so we must re-predict based on the track's embedded features.
+        so we must re-predict based on the track's embedded features and class.
         """
-        if not self._clusterer._fitted:
+        # Check if class-aware clusterer is fitted
+        if not self._class_aware_clusterer or not self._class_aware_clusterer.is_fitted:
             return
 
         # Use .tracks or .confirmed_tracks (Tracker doesn't have active_tracks property)
-        # Using .tracks to cover everything including young candidates
         active_tracks = self._tracker.tracks
         if not active_tracks:
             return
 
         logger.info(f"Re-assigning clusters for {len(active_tracks)} tracks...")
 
-        # Collect embeddings from tracks
-        embeddings = []
-        valid_tracks = []
+        # Re-predict each track using class-aware clusterer
+        updated_count = 0
         for track in active_tracks:
-            # Track stores embeddings as list[np.ndarray], use mean_embedding property
-            if track.embeddings:
-                # Use the mean embedding for stable cluster assignment
-                embeddings.append(track.mean_embedding)
-                valid_tracks.append(track)
+            if not track.embeddings or not track.yolo_class_name:
+                continue
+                
+            # Use the mean embedding for stable cluster assignment
+            embedding = track.mean_embedding
+            if embedding is None:
+                continue
+            
+            # Predict using class-aware clusterer
+            pred = self._class_aware_clusterer.predict(track.yolo_class_name, embedding)
+            
+            # Update track
+            track.cluster_id = pred.cluster_id
+            track.cluster_label = pred.cluster_label
+            track.is_anomaly = pred.is_anomaly
+            
+            # Update cluster history
+            track.cluster_history[pred.cluster_id] += 1
+            updated_count += 1
 
-        if not embeddings:
-            logger.info("No tracks with embeddings to reassign")
-            return
-
-        # Bulk predict
-        embeddings_arr = np.vstack(embeddings)
-        labels = self._clusterer.predict(embeddings_arr)
-
-        # Update tracks
-        for track, label in zip(valid_tracks, labels):
-            track.cluster_id = int(label)
-            # Update cluster history (Counter uses += or direct key increment)
-            track.cluster_history[int(label)] += 1
-
-        logger.info(f"Track re-assignment complete: {len(valid_tracks)} tracks updated")
+        logger.info(f"Track re-assignment complete: {updated_count} tracks updated")
 
     def _log_stats(self) -> None:
         """Log current statistics."""

@@ -84,6 +84,10 @@ class Track:
     bbox: tuple[int, int, int, int]
     cluster_id: int = -1  # Assigned cluster (-1 = unknown)
     cluster_label: str = "Unknown"
+    
+    # YOLO classification
+    yolo_class_name: str = "unknown"  # YOLO detected class (car, truck, etc.)
+    is_anomaly: bool = False  # True if detected as anomaly within its class
 
     # Kalman filter state
     kf: KalmanFilter = field(default=None, repr=False)
@@ -332,6 +336,9 @@ class ObjectTracker:
                 )
 
             track.update(det, embedding)
+            
+            # ALWAYS update yolo_class_name from detection to ensure color consistency
+            track.yolo_class_name = det.class_name
 
             # Update cluster assignment
             if cluster_labels is not None and det_idx < len(cluster_labels):
@@ -356,7 +363,7 @@ class ObjectTracker:
                 embedding = features[det_idx].embedding
 
             cluster_id = -1
-            cluster_label = "Unknown"
+            cluster_label = det.class_name  # Default to YOLO class name
             if cluster_labels is not None and det_idx < len(cluster_labels):
                 cluster_id = int(cluster_labels[det_idx])
                 if cluster_names and cluster_id in cluster_names:
@@ -367,6 +374,7 @@ class ObjectTracker:
                 bbox=det.bbox,
                 cluster_id=cluster_id,
                 cluster_label=cluster_label,
+                yolo_class_name=det.class_name,  # Store YOLO classification
                 entry_time=det.timestamp,
             )
 

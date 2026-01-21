@@ -102,63 +102,71 @@ class FlowAnalyzer:
         # Update active count
         self._stats.active_tracks = len(tracks)
 
-        # Group tracks by cluster
-        cluster_tracks: dict[int, list["Track"]] = defaultdict(list)
+        # Group tracks by cluster_label (class name) instead of cluster_id
+        # This ensures all classes show up even if not clustered
+        label_tracks: dict[str, list["Track"]] = defaultdict(list)
         for track in tracks:
-            cluster_id = track.cluster_id if track.cluster_id >= 0 else -1
-            cluster_tracks[cluster_id].append(track)
+            # Use cluster_label which includes class name and anomaly status
+            label = track.cluster_label if track.cluster_label and track.cluster_label != "Unknown" else track.yolo_class_name
+            if label:  # Skip empty labels
+                label_tracks[label].append(track)
 
             # Track new arrivals
             if track.track_id not in self._seen_track_ids:
                 self._seen_track_ids.add(track.track_id)
                 self._stats.total_objects_tracked += 1
-                self._arrivals.append((current_time, cluster_id, track.track_id))
+                # Use label hash as cluster_id for arrivals tracking
+                self._arrivals.append((current_time, hash(label) if label else -1, track.track_id))
 
         # Trim old arrivals outside flow window
         cutoff = current_time - self.flow_window
         self._arrivals = [(t, c, tid) for t, c, tid in self._arrivals if t > cutoff]
 
-        # Update per-cluster stats
-        for cluster_id, cluster_track_list in cluster_tracks.items():
-            if cluster_id < 0:
-                continue  # Skip unassigned
+        # Reset all active counts to 0 first (so classes with no tracks show 0)
+        for stats in self._stats.cluster_stats.values():
+            stats.active_count = 0
 
-            if cluster_id not in self._stats.cluster_stats:
-                label = cluster_names.get(cluster_id, f"Cluster {cluster_id}") if cluster_names else f"Cluster {cluster_id}"
-                self._stats.cluster_stats[cluster_id] = ClusterFlowStats(
-                    cluster_id=cluster_id,
+        # Update per-label stats (using label as key instead of cluster_id)
+        for label, track_list in label_tracks.items():
+            if not label:
+                continue
+
+            # Use hash of label as pseudo cluster_id for storage
+            label_key = hash(label) % 10000  # Keep it small for readability
+            
+            if label_key not in self._stats.cluster_stats:
+                self._stats.cluster_stats[label_key] = ClusterFlowStats(
+                    cluster_id=label_key,
                     cluster_label=label,
                 )
 
-            stats = self._stats.cluster_stats[cluster_id]
-
-            # Update label if provided
-            if cluster_names and cluster_id in cluster_names:
-                stats.cluster_label = cluster_names[cluster_id]
+            stats = self._stats.cluster_stats[label_key]
+            stats.cluster_label = label  # Always update label
 
             # Active count
-            stats.active_count = len(cluster_track_list)
+            stats.active_count = len(track_list)
 
-            # Update total count for this cluster
-            for track in cluster_track_list:
+            # Update total count for this label
+            for track in track_list:
                 if track.track_id not in stats.seen_track_ids:
                     stats.seen_track_ids.add(track.track_id)
                     stats.total_count += 1
 
-            # Calculate flow rate from arrivals in this cluster
-            cluster_arrivals = [(t, tid) for t, c, tid in self._arrivals if c == cluster_id]
-            if cluster_arrivals:
-                time_span = current_time - cluster_arrivals[0][0]
+            # Calculate flow rate from arrivals with this label
+            label_hash = hash(label) if label else -1
+            label_arrivals = [(t, tid) for t, c, tid in self._arrivals if c == label_hash]
+            if label_arrivals:
+                time_span = current_time - label_arrivals[0][0]
                 if time_span > 0:
-                    stats.flow_rate = (len(cluster_arrivals) / time_span) * 60  # Per minute
+                    stats.flow_rate = (len(label_arrivals) / time_span) * 60
                 else:
                     stats.flow_rate = 0.0
             else:
                 stats.flow_rate = 0.0
 
             # Speed stats
-            if cluster_track_list:
-                speeds = [t.speed for t in cluster_track_list]
+            if track_list:
+                speeds = [t.speed for t in track_list]
                 stats.mean_speed = float(np.mean(speeds)) if speeds else 0.0
 
         return self._stats

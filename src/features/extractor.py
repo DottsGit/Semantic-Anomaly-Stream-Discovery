@@ -234,22 +234,43 @@ class FeatureBuffer:
         """
         self.max_size = max_size
         self._features: list[ObjectFeature] = []
+        self._features_by_class: dict[str, list[ObjectFeature]] = {}
         self._embeddings: np.ndarray | None = None
         self._dirty = True  # Track if embeddings array needs rebuild
 
     def add(self, features: list[ObjectFeature]) -> None:
-        """Add features to the buffer."""
-        self._features.extend(features)
+        """Add features to the buffer (legacy method, also groups by class)."""
+        for feature in features:
+            self._add_single_internal(feature)
+        self._dirty = True
+
+    def _add_single_internal(self, feature: ObjectFeature) -> None:
+        """Internal method to add a single feature."""
+        self._features.append(feature)
+        
+        # Also group by class
+        class_name = feature.detection.class_name
+        if class_name not in self._features_by_class:
+            self._features_by_class[class_name] = []
+        self._features_by_class[class_name].append(feature)
 
         # Trim if over max size (keep most recent)
         if len(self._features) > self.max_size:
-            self._features = self._features[-self.max_size :]
-
-        self._dirty = True
+            # Remove oldest from main list
+            removed = self._features.pop(0)
+            # Also remove from class dict
+            removed_class = removed.detection.class_name
+            if removed_class in self._features_by_class:
+                class_features = self._features_by_class[removed_class]
+                if class_features and class_features[0] is removed:
+                    class_features.pop(0)
+                if not class_features:
+                    del self._features_by_class[removed_class]
 
     def add_single(self, feature: ObjectFeature) -> None:
         """Add a single feature."""
-        self.add([feature])
+        self._add_single_internal(feature)
+        self._dirty = True
 
     @property
     def embeddings(self) -> np.ndarray:
@@ -267,12 +288,54 @@ class FeatureBuffer:
         """Get all features."""
         return self._features
 
+    def get_class_names(self) -> list[str]:
+        """Get list of all class names in the buffer."""
+        return list(self._features_by_class.keys())
+
+    def get_class_counts(self) -> dict[str, int]:
+        """Get count of features per class."""
+        return {name: len(feats) for name, feats in self._features_by_class.items()}
+
+    def get_class_embeddings(self, class_name: str) -> np.ndarray:
+        """Get embeddings for a specific class.
+        
+        Args:
+            class_name: The YOLO class name (e.g., "car", "truck")
+            
+        Returns:
+            Array of embeddings for that class, or empty array if class not found
+        """
+        if class_name not in self._features_by_class:
+            return np.array([])
+        features = self._features_by_class[class_name]
+        if not features:
+            return np.array([])
+        return np.vstack([f.embedding for f in features])
+
+    def get_class_features(self, class_name: str) -> list[ObjectFeature]:
+        """Get features for a specific class."""
+        return self._features_by_class.get(class_name, [])
+
+    def get_embeddings_by_class(self) -> dict[str, np.ndarray]:
+        """Get all embeddings grouped by class.
+        
+        Returns:
+            Dict mapping class_name to numpy array of embeddings
+        """
+        result = {}
+        for class_name in self._features_by_class:
+            embeddings = self.get_class_embeddings(class_name)
+            if len(embeddings) > 0:
+                result[class_name] = embeddings
+        return result
+
     def __len__(self) -> int:
         return len(self._features)
 
     def clear(self) -> None:
         """Clear the buffer."""
         self._features = []
+        self._features_by_class = {}
         self._embeddings = None
         self._dirty = True
 
