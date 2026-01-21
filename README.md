@@ -6,7 +6,7 @@
 
 ## Overview
 
-An unsupervised vision pipeline that ingests video streams, discovers object types through clustering, and tracks flow statistics in real-time.
+An unsupervised vision pipeline that ingests video streams, identifies objects, and discovers anomalies through clustering in real-time.
 
 ## Visuals
 
