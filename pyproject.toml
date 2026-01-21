@@ -3,6 +3,7 @@ name = "semantic-object-stream-discovery"
 version = "0.1.0"
 description = "Unsupervised vision pipeline for object clustering and flow tracking in video streams"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
     # Video processing
