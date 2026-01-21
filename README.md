@@ -1,6 +1,6 @@
-# Semantic Object Stream Discovery
+# Semantic Anomaly Stream Discovery
 
-![Banner](src/assets/SOSD_Banner.png)
+![Banner](src/assets/SASD_Banner.png)
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
@@ -14,7 +14,7 @@ An unsupervised vision pipeline that ingests video streams, discovers object typ
 
 ## Key Features
 
-### Unsupervised Object Discovery
+### Unsupervised Anomaly Discovery
 Leverages DINOv2 features and HDBSCAN to automatically discover and segregate object categories from raw video feeds, eliminating the need for pre-defined labels or supervised training.
 
 ### Real-Time Flow Analytics
