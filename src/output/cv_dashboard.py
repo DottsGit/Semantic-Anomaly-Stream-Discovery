@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+from datetime import datetime
 
 from src.clustering.class_aware_clusterer import ClassAwareClusterer, get_class_color
 
@@ -39,6 +40,7 @@ class CVDashboard:
     
     TAB_CLUSTERS = 0
     TAB_SIGNALS = 1
+    TAB_ANOMALIES = 2
     
     # UI Constants
     TAB_HEIGHT = 35
@@ -81,6 +83,7 @@ class CVDashboard:
         self._mouse_x = 0
         self._mouse_y = 0
         self._mouse_clicked = False
+        self._mouse_down = False
         self._mouse_wheel_delta = 0
         self._window_initialized = False
         
@@ -88,6 +91,19 @@ class CVDashboard:
         self.signal_scroll_y = 0
         self.signal_scroll_max = 0
         self.ROW_HEIGHT = 24
+        
+        # Tab 3: Anomaly Review state
+        self.anomalies: deque = deque(maxlen=50) # (dict with id, class, image, time)
+        self.selected_anomaly_idx = -1
+        self.anomaly_scroll_y = 0
+        self.anomaly_scroll_max = 0
+        self.anomaly_filter_class: str | None = None
+        self.anomaly_dropdown_open: bool = False
+        self.is_dragging_scrollbar: bool = False
+        self.drag_start_y: int = 0
+        self.drag_start_scroll_y: int = 0
+
+
         
     def _init_window(self) -> None:
         """Initialize OpenCV window with mouse callback."""
@@ -105,6 +121,10 @@ class CVDashboard:
         
         if event == cv2.EVENT_LBUTTONDOWN:
             self._mouse_clicked = True
+            self._mouse_down = True
+        elif event == cv2.EVENT_LBUTTONUP:
+            self._mouse_down = False
+            self.is_dragging_scrollbar = False # Stop dragging globally
         elif event == cv2.EVENT_MOUSEWHEEL:
             # flags > 0 means scroll up, < 0 means scroll down
             # Standard convention: wheel up (positive) -> scroll up (decrease offset)
@@ -154,9 +174,35 @@ class CVDashboard:
         for label, history in self.signal_history.items():
             count = active_counts.get(label, 0)
             history.counts.append(count)
-            # Update max ever seen
             if count > history.max_count:
                 history.max_count = count
+                
+    def register_anomaly(
+        self, 
+        track_id: int, 
+        class_name: str, 
+        image: np.ndarray
+    ) -> None:
+        """Register a new anomaly event."""
+        # Add to deque (left = newest)
+        self.anomalies.appendleft({
+            "id": track_id,
+            "class": class_name,
+            "image": image.copy(),
+            "time": datetime.now()
+        })
+        # If nothing selected, select the new one (index 0)
+        if self.selected_anomaly_idx == -1:
+            self.selected_anomaly_idx = 0
+        # If something selected, shift index by 1 so we stay on same item? 
+        # No, auto-selecting new one is better for "live" feel, 
+        # OR keep selection on specific item? 
+        # Standard behavior: If I'm looking at item X, don't jump to New Item Y.
+        # But if we shift items down, index 0 becomes index 1.
+        elif self.selected_anomaly_idx >= 0:
+            self.selected_anomaly_idx += 1
+            if self.selected_anomaly_idx >= len(self.anomalies):
+                self.selected_anomaly_idx = len(self.anomalies) - 1
                 
     def draw(self, class_aware_clusterer: ClassAwareClusterer | None) -> np.ndarray:
         """Draw the dashboard.
@@ -183,8 +229,10 @@ class CVDashboard:
         
         if self.current_tab == self.TAB_CLUSTERS:
             self._draw_cluster_tab(content_area, class_aware_clusterer)
-        else:
+        elif self.current_tab == self.TAB_SIGNALS:
             self._draw_signal_tab(content_area)
+        else:
+            self._draw_anomaly_tab(content_area)
             
         # Reset click state
         self._mouse_clicked = False
@@ -192,19 +240,21 @@ class CVDashboard:
         return canvas
         
     def _handle_ui_interactions(self) -> None:
-        """Process mouse clicks on UI elements."""
-        if not self._mouse_clicked:
+        """Process mouse clicks and scroll on UI elements."""
+        # Check if we have any interaction (click, scroll, or dragging)
+        if not self._mouse_clicked and self._mouse_wheel_delta == 0 and not self.is_dragging_scrollbar:
             return
             
-        # Tab clicks
-        if self._mouse_y < self.TAB_HEIGHT:
-            tab_width = self.width // 2
+        # Tab clicks (only on actual click)
+        if self._mouse_clicked and self._mouse_y < self.TAB_HEIGHT:
+            tab_width = self.width // 3
             if self._mouse_x < tab_width:
                 self.current_tab = self.TAB_CLUSTERS
-                self.dropdown_open = False
-            else:
+            elif self._mouse_x < 2 * tab_width:
                 self.current_tab = self.TAB_SIGNALS
-                self.dropdown_open = False
+            else:
+                self.current_tab = self.TAB_ANOMALIES
+            self.dropdown_open = False
             return
         
         # Tab-specific interactions
@@ -213,8 +263,10 @@ class CVDashboard:
         
         if self.current_tab == self.TAB_CLUSTERS:
             self._handle_cluster_tab_click(local_y)
-        else:
+        elif self.current_tab == self.TAB_SIGNALS:
             self._handle_signal_tab_click(local_y)
+        else:
+            self._handle_anomaly_tab_click(local_y)
             
     def _handle_cluster_tab_click(self, local_y: int) -> None:
         """Handle clicks in cluster tab."""
@@ -289,12 +341,123 @@ class CVDashboard:
             if CHECK_A_X <= self._mouse_x <= CHECK_A_X + self.CHECKBOX_SIZE:
                  if anomaly_label in self.signal_checkboxes:
                     self.signal_checkboxes[anomaly_label] = not self.signal_checkboxes[anomaly_label]
+                    
+    def _handle_anomaly_tab_click(self, local_y: int) -> None:
+        """Handle clicks and scroll in anomaly tab."""
+        # 1. Scroll (apply even if not clicked)
+        if self._mouse_wheel_delta != 0:
+            scroll_step = 40 # Increased sensitivity
+            self.anomaly_scroll_y -= self._mouse_wheel_delta * scroll_step
+            self.anomaly_scroll_y = max(0, min(self.anomaly_scroll_y, self.anomaly_scroll_max))
+            self._mouse_wheel_delta = 0
+            
+        # 2. Handle Scrollbar Dragging
+        PANEL_WIDTH = 250
+        DROPDOWN_H = 30
+        
+        # Calculate list geometry for dragging logic
+        list_y_abs = self.PADDING + DROPDOWN_H + self.PADDING
+        list_area_h = self.height - list_y_abs - self.TAB_HEIGHT - 5 # Approximate
+        # We need exact height to map correctly. 
+        # But we can assume list_area_h is roughly height - list_y_abs
+        list_area_h = max(1, self.height - list_y_abs) 
+        
+        # If dragging
+        if self.is_dragging_scrollbar:
+             delta_y = self._mouse_y - self.drag_start_y
+             # Map delta pixels to scroll pixels
+             # Ratio: scroll_max / logic_track_h
+             scroll_ratio = 1.0
+             if list_area_h > 20: 
+                 scroll_ratio = self.anomaly_scroll_max / list_area_h
+             
+             self.anomaly_scroll_y = self.drag_start_scroll_y + int(delta_y * scroll_ratio)
+             self.anomaly_scroll_y = max(0, min(self.anomaly_scroll_y, self.anomaly_scroll_max))
+             return
+
+        if not self._mouse_clicked:
+            return
+            
+        # 3. Check for Click on Scrollbar
+        sb_w = 10 # Hit area wider than visual
+        if PANEL_WIDTH - sb_w <= self._mouse_x <= PANEL_WIDTH:
+            if list_y_abs <= local_y:
+                self.is_dragging_scrollbar = True
+                self.drag_start_y = self._mouse_y
+                self.drag_start_scroll_y = self.anomaly_scroll_y
+                return
+
+        # 4. Handle Dropdown / Filtering
+        # Left panel width is fixed (e.g. 250)
+        PANEL_WIDTH = 250
+        DROPDOWN_H = 30
+        
+        # Check if click is in dropdown area (top of panel)
+        if self._mouse_x <= PANEL_WIDTH:
+            # Header
+            if self.PADDING <= local_y <= self.PADDING + DROPDOWN_H:
+                self.anomaly_dropdown_open = not self.anomaly_dropdown_open
+                return
+                
+            # Items (if open)
+            if self.anomaly_dropdown_open:
+                # Calculate filtering options
+                classes = sorted(list({item['class'] for item in self.anomalies}))
+                options = ["All Classes"] + classes
+                
+                item_y = self.PADDING + DROPDOWN_H
+                for i, opt in enumerate(options):
+                    if item_y <= local_y <= item_y + DROPDOWN_H:
+                         if opt == "All Classes":
+                             self.anomaly_filter_class = None
+                         else:
+                             self.anomaly_filter_class = opt
+                         self.anomaly_dropdown_open = False
+                         self.anomaly_scroll_y = 0 # Reset scroll
+                         return
+                    item_y += DROPDOWN_H
+                # If clicked outside items but in panel, maybe close?
+                self.anomaly_dropdown_open = False
+                return
+
+        # 3. Click on list item
+        if self._mouse_x > PANEL_WIDTH:
+            return
+            
+        # Adjust for dropdown header height (fixed) 
+        # The list starts AFTER the dropdown header
+        list_y_start = self.PADDING + DROPDOWN_H + self.PADDING
+        
+        rel_y = local_y + self.anomaly_scroll_y - list_y_start
+        if rel_y < 0:
+            return
+            
+        # Get filtered list to map index correctly
+        filtered_items = [
+            item for item in self.anomalies 
+            if self.anomaly_filter_class is None or item['class'] == self.anomaly_filter_class
+        ]
+            
+        ITEM_HEIGHT = 40
+        row_idx = rel_y // ITEM_HEIGHT
+        
+        if 0 <= row_idx < len(filtered_items):
+            # Find the actual index of this item in the main deque
+            # We need to match by ID presumably? 
+            # Or just store selected ITEM, not index
+            target_item = filtered_items[row_idx]
+            
+            # Find index in self.anomalies
+            for i, item in enumerate(self.anomalies):
+                if item['id'] == target_item['id']:
+                    self.selected_anomaly_idx = i
+                    break
         
     def _draw_tabs(self, canvas: np.ndarray) -> None:
         """Draw tab bar."""
-        tab_width = self.width // 2
+        tab_width = self.width // 3
         
-        tabs = ["Clusters", "Signal Monitor"]
+        tabs = ["Clusters", "Signal Monitor", "Anomalies"]
         for i, name in enumerate(tabs):
             x1 = i * tab_width
             x2 = (i + 1) * tab_width
@@ -647,3 +810,144 @@ class CVDashboard:
         self._init_window()
         img = self.draw(class_aware_clusterer)
         cv2.imshow(self.window_name, img)
+        
+    def _draw_anomaly_tab(self, canvas: np.ndarray) -> None:
+        """Draw anomaly review tab."""
+        h, w = canvas.shape[:2]
+        
+        # Left Panel: List
+        PANEL_WIDTH = 250
+        cv2.rectangle(canvas, (0, 0), (PANEL_WIDTH, h), (40, 40, 40), -1)
+        
+        # Dropdown area
+        dropdown_x = self.PADDING
+        dropdown_y = self.PADDING
+        dropdown_w = PANEL_WIDTH - 2 * self.PADDING
+        dropdown_h = 30
+        
+        # Filter Logic
+        filtered_items = [
+            item for item in self.anomalies 
+            if self.anomaly_filter_class is None or item['class'] == self.anomaly_filter_class
+        ]
+        
+        # Calculate list height
+        ITEM_HEIGHT = 40
+        num_items = len(filtered_items)
+        
+        # List starts below dropdown
+        list_y_abs = dropdown_y + dropdown_h + self.PADDING
+        list_area_h = h - list_y_abs
+        total_list_h = num_items * ITEM_HEIGHT
+        
+        self.anomaly_scroll_max = max(0, total_list_h - list_area_h)
+        y_start_draw = list_y_abs - self.anomaly_scroll_y
+        
+        # Draw List Items
+        for i, item in enumerate(filtered_items):
+            y = y_start_draw + i * ITEM_HEIGHT
+            
+            # Clip
+            if y < list_y_abs - ITEM_HEIGHT or y > h:
+                continue
+                
+            # Highlight selected (check ID)
+            is_selected = False
+            if 0 <= self.selected_anomaly_idx < len(self.anomalies):
+                 if self.anomalies[self.selected_anomaly_idx]['id'] == item['id']:
+                     is_selected = True
+            
+            if is_selected:
+                cv2.rectangle(canvas, (0, y), (PANEL_WIDTH, y + ITEM_HEIGHT), (60, 60, 60), -1)
+                cv2.rectangle(canvas, (0, y), (PANEL_WIDTH, y + ITEM_HEIGHT), (100, 100, 100), 1)
+            
+            # Text
+            time_str = item["time"].strftime("%H:%M:%S")
+            label = f"{item['class']} #{item['id']}"
+            color = get_class_color(item['class'], True)
+            
+            cv2.putText(canvas, label, (10, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 
+                       0.5, color, 1)
+            cv2.putText(canvas, time_str, (10, y + 36), cv2.FONT_HERSHEY_SIMPLEX, 
+                       0.4, (150, 150, 150), 1)
+                       
+        # Draw Dropdown (Last to overlay list)
+        cv2.rectangle(canvas, (dropdown_x, dropdown_y), 
+                     (dropdown_x + dropdown_w, dropdown_y + dropdown_h), 
+                     self.dropdown_bg, -1)
+        cv2.rectangle(canvas, (dropdown_x, dropdown_y), 
+                     (dropdown_x + dropdown_w, dropdown_y + dropdown_h), 
+                     (100, 100, 100), 1)
+                     
+        current_filter = self.anomaly_filter_class if self.anomaly_filter_class else "All Classes"
+        cv2.putText(canvas, f"Filter: {current_filter}", (dropdown_x + 8, dropdown_y + 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.text_color, 1)
+                   
+        # Dropdown list (if open)
+        if self.anomaly_dropdown_open:
+             classes = sorted(list({item['class'] for item in self.anomalies}))
+             options = ["All Classes"] + classes
+             
+             opt_y = dropdown_y + dropdown_h
+             for opt in options:
+                 cv2.rectangle(canvas, (dropdown_x, opt_y), 
+                              (dropdown_x + dropdown_w, opt_y + dropdown_h), 
+                              self.dropdown_bg, -1)
+                 cv2.rectangle(canvas, (dropdown_x, opt_y), 
+                              (dropdown_x + dropdown_w, opt_y + dropdown_h), 
+                              (80, 80, 80), 1)
+                 cv2.putText(canvas, opt, (dropdown_x + 8, opt_y + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.text_color, 1)
+                 opt_y += dropdown_h
+
+        # Scrollbar (List)
+        if self.anomaly_scroll_max > 0:
+            sb_w = 4
+            sb_x = PANEL_WIDTH - sb_w - 2
+            track_h = list_area_h - 10
+            scroll_ratio = self.anomaly_scroll_y / self.anomaly_scroll_max
+            thumb_h = max(20, int(track_h * (list_area_h / total_list_h))) if total_list_h > 0 else 20
+            thumb_y = list_y_abs + 5 + int(scroll_ratio * (track_h - thumb_h))
+            
+            cv2.rectangle(canvas, (sb_x, thumb_y), (sb_x+sb_w, thumb_y+thumb_h), (100, 100, 100), -1)
+
+        # Right Panel: Preview
+        preview_x = PANEL_WIDTH + self.PADDING
+        preview_y = self.PADDING
+        preview_w = w - preview_x - self.PADDING
+        preview_h = h - 2 * self.PADDING
+        
+        if 0 <= self.selected_anomaly_idx < len(self.anomalies):
+            item = self.anomalies[self.selected_anomaly_idx]
+            img = item["image"]
+            
+            if img is not None and img.size > 0:
+                # Resize to fit while maintaining aspect ratio
+                ih, iw = img.shape[:2]
+                scale = min(preview_w / iw, preview_h / ih)
+                new_w = int(iw * scale)
+                new_h = int(ih * scale)
+                
+                resized = cv2.resize(img, (new_w, new_h))
+                
+                # Center
+                x_off = preview_x + (preview_w - new_w) // 2
+                y_off = preview_y + (preview_h - new_h) // 2
+                
+                canvas[y_off:y_off+new_h, x_off:x_off+new_w] = resized
+                
+                # Draw border
+                cv2.rectangle(canvas, (x_off, y_off), (x_off+new_w, y_off+new_h), (255, 255, 255), 1)
+                
+                # Info overlay
+                cv2.putText(canvas, f"Class: {item['class']}", (preview_x, preview_y + 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.text_color, 1)
+                cv2.putText(canvas, f"Track ID: {item['id']}", (preview_x, preview_y + 45),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.text_color, 1)
+                cv2.putText(canvas, f"Time: {item['time'].strftime('%H:%M:%S')}", (preview_x, preview_y + 70),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.text_color, 1)
+        else:
+            # No selection
+            msg = "Select an anomaly"
+            cv2.putText(canvas, msg, (preview_x + 50, preview_y + 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 1)

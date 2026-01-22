@@ -284,12 +284,11 @@ class Pipeline:
         self._last_cluster_time: float = 0
         self._tuned: bool = False
         self._frame_count: int = 0
-        self._frame_count: int = 0
         self._last_log_time: float = 0
-        self._last_process_time: float = 0
         self._last_process_time: float = 0
         self._process_interval: float = 0
         self._last_detections: list = []
+        self._recorded_anomalies: set = set()
 
     def _init_components(self) -> None:
         """Initialize all pipeline components."""
@@ -636,6 +635,25 @@ class Pipeline:
             label = track.cluster_label if track.cluster_label and track.cluster_label != "Unknown" else track.yolo_class_name
             display_label = f"{label} #{track.track_id}"
             draw_text_with_outline(annotated, display_label, (x1, y1 - 10), 0.6, color)
+            
+            # Anomaly Capture Logic
+            if track.is_anomaly and track.track_id not in self._recorded_anomalies:
+                try:
+                    # Capture crop from ORIGINAL frame (not annotated)
+                    H, W = frame.image.shape[:2]
+                    cx1, cy1 = max(0, x1), max(0, y1)
+                    cx2, cy2 = min(W, x2), min(H, y2)
+                    
+                    if cx2 > cx1 and cy2 > cy1:
+                        crop = frame.image[cy1:cy2, cx1:cx2]
+                        self._dashboard.register_anomaly(
+                            track.track_id, 
+                            track.yolo_class_name, 
+                            crop
+                        )
+                        self._recorded_anomalies.add(track.track_id)
+                except Exception as e:
+                    logger.warning(f"Failed to capture anomaly crop: {e}")
 
             # Trajectory
             if len(track.positions) > 1:
