@@ -68,7 +68,7 @@ from src.detection.detector import ObjectDetector
 from src.features.extractor import DINOv2Extractor, FeatureBuffer
 from src.ingestion.video_source import BufferedVideoSource, Frame, create_video_source
 from src.output.gcp_outputs import BigQueryWriter, PubSubPublisher
-from src.output.visualizer import ClusterVisualizer
+from src.output.cv_dashboard import CVDashboard
 from src.tracking.tracker import ObjectTracker
 
 console = Console()
@@ -269,7 +269,7 @@ class Pipeline:
         self._bigquery: BigQueryWriter | None = None
         
         # Visualization
-        self._cluster_visualizer: ClusterVisualizer | None = None
+        self._dashboard: CVDashboard | None = None
         
         # Async processing
         self._executor: ThreadPoolExecutor | None = None
@@ -337,13 +337,13 @@ class Pipeline:
         
         # Per-class clusterer (primary clustering mechanism)
         self._class_aware_clusterer = ClassAwareClusterer(
-            min_samples_percentage=0.05,  # 5% of total samples
+            min_samples_percentage=0.01,  # 1% of total samples
             min_samples_absolute=15,  # Absolute minimum floor
             algorithm=self.config.cluster_algorithm,
-            min_cluster_size=self.config.min_cluster_size,
+            min_cluster_size=15,  # Low floor for small classes (dynamic scaling handles large ones)
             use_pca=True,
             pca_n_components=self.config.pca_n_components,
-            cluster_scale=self.config.min_cluster_scale,
+            cluster_scale=0.005,  # 0.5% of samples (safer for large datasets)
         )
 
         # Tracker
@@ -371,8 +371,8 @@ class Pipeline:
             )
             self._bigquery.connect()
             
-        # Visualizer
-        self._cluster_visualizer = ClusterVisualizer(width=600, height=600)
+        # Dashboard (tabbed visualization)
+        self._dashboard = CVDashboard(width=600, height=500)
 
         logger.info("All components initialized")
         self._process_interval = 1.0 / self.config.processing_fps
@@ -693,10 +693,17 @@ class Pipeline:
 
         cv2.imshow("SOSD - Object Flow Tracker", annotated)
         
-        # Draw and show cluster visualizer
-        if self._cluster_visualizer:
-            viz_img = self._cluster_visualizer.draw(self._clusterer.result)
-            cv2.imshow("SOSD - Clusters", viz_img)
+        # Update and show dashboard
+        if self._dashboard:
+            # Get active counts from flow analyzer for signal monitor
+            active_counts = {}
+            if self._flow_analyzer:
+                stats = self._flow_analyzer.get_flow_summary()
+                for cluster_name, cluster_stats in stats.get("clusters", {}).items():
+                    active_counts[cluster_name] = cluster_stats.get("active", 0)
+            
+            self._dashboard.update(self._class_aware_clusterer, active_counts)
+            self._dashboard.show(self._class_aware_clusterer)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             self._stop_event.set()
