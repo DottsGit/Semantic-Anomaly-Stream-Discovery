@@ -198,8 +198,10 @@ class YouTubeSource(VideoSource):
         try:
             import yt_dlp
 
+            # Prefer direct MP4/WEBM URLs over HLS manifests
+            # HLS manifests (m3u8) require additional parsing that OpenCV can't do
             ydl_opts = {
-                "format": "best[ext=mp4]/best",
+                "format": "best[protocol!=m3u8][protocol!=m3u8_native][ext=mp4]/best[protocol!=m3u8][protocol!=m3u8_native]/best[ext=mp4]/best",
                 "quiet": True,
                 "no_warnings": True,
             }
@@ -207,15 +209,33 @@ class YouTubeSource(VideoSource):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(self.url, download=False)
                 if info and "url" in info:
-                    return info["url"]
+                    url = info["url"]
+                    # Verify it's not an HLS manifest
+                    if not url.endswith(".m3u8") and "manifest" not in url.lower():
+                        return url
                 # For playlists or live streams, get the first entry
                 if info and "entries" in info and info["entries"]:
-                    return info["entries"][0].get("url")
-                # Try formats directly
+                    entry = info["entries"][0]
+                    if entry.get("url") and not entry["url"].endswith(".m3u8"):
+                        return entry["url"]
+                # Try formats directly - find best non-HLS format
                 if info and "formats" in info:
-                    for fmt in reversed(info["formats"]):
-                        if fmt.get("url"):
-                            return fmt["url"]
+                    # Sort by quality (resolution/tbr) descending
+                    formats = sorted(
+                        [f for f in info["formats"] if f.get("url")],
+                        key=lambda x: (x.get("height") or 0, x.get("tbr") or 0),
+                        reverse=True
+                    )
+                    for fmt in formats:
+                        url = fmt.get("url", "")
+                        protocol = fmt.get("protocol", "")
+                        # Skip HLS/DASH manifests
+                        if "m3u8" in protocol or "dash" in protocol:
+                            continue
+                        if url.endswith(".m3u8") or "manifest" in url.lower():
+                            continue
+                        logger.info(f"Selected format: {fmt.get('format_id')} - {fmt.get('height')}p {fmt.get('ext')}")
+                        return url
             return None
         except ImportError:
             return None
