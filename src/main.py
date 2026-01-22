@@ -1,4 +1,4 @@
-"""Main SOSD pipeline orchestrating all components."""
+"""Main SASD pipeline orchestrating all components."""
 
 from __future__ import annotations
 
@@ -126,9 +126,9 @@ class PipelineConfig:
     enable_display: bool = True
     enable_pubsub: bool = False
     pubsub_project: str = ""
-    pubsub_topic: str = "sosd-events"
+    pubsub_topic: str = "sasd-events"
     enable_bigquery: bool = False
-    bigquery_dataset: str = "sosd"
+    bigquery_dataset: str = "sasd"
     bigquery_table: str = "tracking_events"
     log_interval: int = 5
 
@@ -243,7 +243,7 @@ def warmup_worker() -> bool:
 
 
 class Pipeline:
-    """Main SOSD pipeline."""
+    """Main SASD pipeline."""
 
     def __init__(self, config: PipelineConfig):
         """Initialize the pipeline.
@@ -709,7 +709,7 @@ class Pipeline:
                 draw_text_with_outline(annotated, anom_str, (170, y_offset), 0.45, anom_color, 1)
                 y_offset += 18
 
-        cv2.imshow("SOSD - Object Flow Tracker", annotated)
+        cv2.imshow("SASD - Object Flow Tracker", annotated)
         
         # Update and show dashboard
         if self._dashboard:
@@ -986,7 +986,7 @@ class Pipeline:
                 f"Total Runtime: {final_stats['elapsed_time']:.1f}s\n"
                 f"Total Objects Tracked: {final_stats['total_tracked']}\n"
                 f"Frames Processed: {self._frame_count}",
-                title="SOSD Pipeline Complete",
+                title="SASD Pipeline Complete",
             ))
 
         logger.info("Pipeline stopped")
@@ -996,7 +996,7 @@ def main():
     """CLI entry point."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="SOSD - Semantic Object Stream Discovery")
+    parser = argparse.ArgumentParser(description="SASD - Semantic Object Stream Discovery")
     parser.add_argument("source", help="Video source (URL, file path, or webcam index)")
     parser.add_argument("--type", default="auto", choices=["auto", "rtsp", "hls", "youtube", "file", "webcam"])
     parser.add_argument("--warmup", type=int, default=60, help="Warmup duration in seconds")

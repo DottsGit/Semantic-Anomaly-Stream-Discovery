@@ -133,7 +133,7 @@ def create_cluster_scatter(embeddings_2d: np.ndarray, labels: np.ndarray) -> go.
 def main():
     """Run the Streamlit dashboard."""
     st.set_page_config(
-        page_title="SOSD - Object Flow Tracker",
+        page_title="SASD - Object Flow Tracker",
         page_icon="🚗",
         layout="wide",
     )
@@ -234,7 +234,7 @@ def main():
     st.markdown("---")
     st.markdown(
         "Built with DINOv2 + HDBSCAN | "
-        "[Documentation](https://github.com/yourrepo/sosd)"
+        "[Documentation](https://github.com/yourrepo/sasd)"
     )
 
 

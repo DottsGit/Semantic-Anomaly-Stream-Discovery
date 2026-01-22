@@ -8,9 +8,9 @@
 
 An unsupervised vision pipeline that ingests video streams, identifies objects, and discovers anomalies through clustering in real-time.
 
-## Visuals
+https://github.com/user-attachments/assets/c8ccabc6-72b0-41af-a049-d8e15517f58c
 
-![Demo](docs/images/demo.gif)
+https://github.com/user-attachments/assets/f5afa90e-02ee-426a-82c5-628642efb9e1
 
 ## Key Features
 
@@ -26,8 +26,8 @@ Combines high-performance SORT tracking with custom flow analysis to calculate v
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourrepo/semantic-object-stream-discovery.git
-cd semantic-object-stream-discovery
+git clone https://github.com/yourrepo/semantic-anomaly-stream-discovery.git
+cd semantic-anomaly-stream-discovery
 
 # Install dependencies
 pip install -e .
